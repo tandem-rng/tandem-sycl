@@ -8,7 +8,9 @@
 
 #include <sycl/sycl.hpp>
 
+#include <bit>
 #include <complex>
+#include <cstring>
 #include <cstdint>
 #include <stdexcept>
 #include <type_traits>
@@ -29,86 +31,80 @@ struct below32 {};  /* Lemire bounded draws over the u32 fill, see PURPOSE_BELOW
 struct below64 {};
 
 /* The fill's geometry: stream bits [p0, p1), rows r0 .. r1 inclusive, groups g0 .. g1, and
- * what the bounded kinds need: the fill's key and chunk length, and the range. The normal fill
- * keeps its element count in `range`. */
+ * what the bounded kinds need: the fill's key and chunk length, the range and its rejection
+ * threshold. The normal fill keeps its element count in `range`. */
 struct Span {
     uint64_t p0, p1, r0, r1, g0, g1;
     uint32_t K;
     Key key;
-    uint64_t range;
+    uint64_t range, thresh;
 };
 
 /* How an output element is made from a block: element k of the block takes bits
- * [k bits, (k + 1) bits). `e` is its global draw index, which keys the bounded kinds' fallback
- * stream (Appendix A of the specification), so a fill cut into pieces equals the whole fill. */
+ * [k bits, (k + 1) bits). The bounded kinds give the draw, which block_values maps. */
 template <class Kind> struct elem;
 
 template <> struct elem<bool> {
     using out_t = bool;
-    static constexpr unsigned bits = 1;
-    static bool make(const uint32_t w[4], unsigned k, uint64_t, const Span &) {
-        return (w[k >> 5] >> (k & 31u)) & 1u;
-    }
+    static constexpr unsigned bits = 1; /* see store_bool_part */
 };
 template <> struct elem<uint8_t> {
     using out_t = uint8_t;
     static constexpr unsigned bits = 8;
-    static uint8_t make(const uint32_t w[4], unsigned k, uint64_t, const Span &) {
+    static uint8_t make(const uint32_t w[4], unsigned k) {
         return (uint8_t)(w[k >> 2] >> ((k & 3u) * 8u));
     }
 };
 template <> struct elem<uint16_t> {
     using out_t = uint16_t;
     static constexpr unsigned bits = 16;
-    static uint16_t make(const uint32_t w[4], unsigned k, uint64_t, const Span &) {
+    static uint16_t make(const uint32_t w[4], unsigned k) {
         return (uint16_t)(w[k >> 1] >> ((k & 1u) * 16u));
     }
 };
 template <> struct elem<f16_bits> {
     using out_t = uint16_t;
     static constexpr unsigned bits = 16;
-    static uint16_t make(const uint32_t w[4], unsigned k, uint64_t e, const Span &s) {
-        return to_f16_bits(elem<uint16_t>::make(w, k, e, s));
+    static uint16_t make(const uint32_t w[4], unsigned k) {
+        return to_f16_bits(elem<uint16_t>::make(w, k));
     }
 };
 template <> struct elem<uint32_t> {
     using out_t = uint32_t;
     static constexpr unsigned bits = 32;
-    static uint32_t make(const uint32_t w[4], unsigned k, uint64_t, const Span &) { return w[k]; }
+    static uint32_t make(const uint32_t w[4], unsigned k) { return w[k]; }
 };
 template <> struct elem<float> {
     using out_t = float;
     static constexpr unsigned bits = 32;
-    static float make(const uint32_t w[4], unsigned k, uint64_t, const Span &) {
+    static float make(const uint32_t w[4], unsigned k) {
         return to_f32(w[k]);
     }
 };
 template <> struct elem<uint64_t> {
     using out_t = uint64_t;
     static constexpr unsigned bits = 64;
-    static uint64_t make(const uint32_t w[4], unsigned k, uint64_t, const Span &) {
+    static uint64_t make(const uint32_t w[4], unsigned k) {
         return w[2 * k] | ((uint64_t)w[2 * k + 1] << 32);
     }
 };
 template <> struct elem<double> {
     using out_t = double;
     static constexpr unsigned bits = 64;
-    static double make(const uint32_t w[4], unsigned k, uint64_t, const Span &) {
+    static double make(const uint32_t w[4], unsigned k) {
         return to_f64(w[2 * k] | ((uint64_t)w[2 * k + 1] << 32));
     }
 };
 template <> struct elem<below32> {
     using out_t = uint32_t;
     static constexpr unsigned bits = 32;
-    static uint32_t make(const uint32_t w[4], unsigned k, uint64_t e, const Span &s) {
-        return below_u32(w[k], (uint32_t)s.range, s.key.w, s.K, e);
-    }
+    static uint32_t draw(const uint32_t w[4], unsigned k) { return w[k]; }
 };
 template <> struct elem<below64> {
     using out_t = uint64_t;
     static constexpr unsigned bits = 64;
-    static uint64_t make(const uint32_t w[4], unsigned k, uint64_t e, const Span &s) {
-        return below_u64(w[2 * k] | ((uint64_t)w[2 * k + 1] << 32), s.range, s.key.w, s.K, e);
+    static uint64_t draw(const uint32_t w[4], unsigned k) {
+        return w[2 * k] | ((uint64_t)w[2 * k + 1] << 32);
     }
 };
 
@@ -123,6 +119,89 @@ template <class Kind> bool blocks_aligned(const typename elem<Kind>::out_t *out,
     return ((reinterpret_cast<uintptr_t>(out) - first) & 15u) == 0;
 }
 
+/* An N-byte store, N = 8 or 16, to an N-byte aligned address. NVPTX receives a copy of a
+ * 16-byte struct as narrower stores, so clang stores a vector type. */
+template <unsigned N> inline void store_wide(void *dst, const void *src) {
+#if defined(__clang__)
+    typedef uint32_t words __attribute__((ext_vector_type(N / 4)));
+    words x;
+    std::memcpy(&x, src, N);
+    *static_cast<words *>(dst) = x;
+#else
+    std::memcpy(__builtin_assume_aligned(dst, N), src, N);
+#endif
+}
+
+/* Stream bits [P + 16 q, P + 16 q + 16) of a bool fill, which are 16 output bytes, from the
+ * block w at stream bit P. */
+template <bool ALIGNED>
+inline void store_bool_part(bool *out, const Span &s, uint64_t P, const uint32_t w[4],
+                            unsigned q) {
+    uint64_t first = P + 16u * q;
+    uint32_t x = w[q >> 1] >> ((q & 1u) * 16u);
+    if (ALIGNED && first >= s.p0 && first + 16u <= s.p1) {
+        Block v;
+        /* Spread four bits over the low bits of four bytes. */
+        for (unsigned t = 0; t < 4; t++)
+            v.w[t] = (((x >> (4 * t)) & 0xfu) * 0x00204081u) & 0x01010101u;
+        store_wide<16>(out + (first - s.p0), &v);
+        return;
+    }
+    for (unsigned k = 0; k < 16; k++)
+        if (first + k >= s.p0 && first + k < s.p1)
+            out[first + k - s.p0] = (x >> k) & 1u;
+}
+
+template <class Kind>
+constexpr bool is_below = std::is_same_v<Kind, below32> || std::is_same_v<Kind, below64>;
+
+/* The elements of the block at stream bit P, by Lemire's method for the bounded kinds, as
+ * below_u32_t and below_u64_t in core.hpp. Those accept or flag every draw of the block first
+ * and then retry the flagged ones in one loop, because a device compiler that inlines
+ * everything would otherwise copy the retry, a generator's seeding, once per element. The
+ * retry of draw k takes the global draw index (P + k bits) / bits, as Appendix A of the
+ * specification says, so a fill cut into pieces equals the whole fill. */
+template <class Kind>
+inline void block_values(const uint32_t w[4], uint64_t P, const Span &s,
+                         typename elem<Kind>::out_t x[]) {
+    using O = typename elem<Kind>::out_t;
+    constexpr unsigned bits = elem<Kind>::bits, per_block = 128 / bits;
+    if constexpr (is_below<Kind>) {
+        const O range = (O)s.range, t = (O)s.thresh;
+        unsigned rejected = 0;
+        for (unsigned k = 0; k < per_block; k++) {
+            O u = elem<Kind>::draw(w, k), lo;
+            if constexpr (sizeof(O) == 4) {
+                uint64_t m = (uint64_t)u * range;
+                x[k] = (O)(m >> 32);
+                lo = (O)m;
+            } else {
+                x[k] = mulhi64(u, range);
+                lo = u * range;
+            }
+            if (lo < t)
+                rejected |= 1u << k;
+        }
+        while (rejected) {
+            unsigned k = (unsigned)std::countr_zero(rejected);
+            rejected &= rejected - 1u;
+            uint64_t g = P / bits + k;
+            O v;
+            if constexpr (sizeof(O) == 4)
+                v = below_retry_u32(range, t, s.key.w, s.K, g);
+            else
+                v = below_retry_u64(range, t, s.key.w, s.K, g);
+            /* A select per element, since a variable index would put x in local memory. */
+            for (unsigned j = 0; j < per_block; j++)
+                if (j == k)
+                    x[j] = v;
+        }
+    } else {
+        for (unsigned k = 0; k < per_block; k++)
+            x[k] = elem<Kind>::make(w, k);
+    }
+}
+
 /* Store the elements of the block at stream bit P that fall inside the fill's bits [p0, p1).
  * With ALIGNED a block fully inside leaves as 16-byte stores: one, or eight for bool, whose
  * 128 elements are one byte each. */
@@ -131,33 +210,21 @@ inline void store_block(typename elem<Kind>::out_t *out, const Span &s, uint64_t
                         const uint32_t w[4]) {
     using O = typename elem<Kind>::out_t;
     constexpr unsigned bits = elem<Kind>::bits, per_block = 128 / bits;
-    if constexpr (ALIGNED) {
-        if (P >= s.p0 && P + 128u <= s.p1) {
-            uint64_t e0 = (P - s.p0) / bits;
-            if constexpr (std::is_same_v<Kind, bool>) {
-                for (unsigned q = 0; q < 8; q++) {
-                    uint32_t x = w[q >> 1] >> ((q & 1u) * 16u);
-                    Block v;
-                    /* Spread four bits over the low bits of four bytes. */
-                    for (unsigned t = 0; t < 4; t++)
-                        v.w[t] = (((x >> (4 * t)) & 0xfu) * 0x00204081u) & 0x01010101u;
-                    *reinterpret_cast<Block *>(out + e0 + 16 * q) = v;
-                }
-            } else {
-                struct alignas(16) Vec {
-                    O v[per_block];
-                } x;
-                for (unsigned k = 0; k < per_block; k++)
-                    x.v[k] = elem<Kind>::make(w, k, P / bits + k, s);
-                *reinterpret_cast<Vec *>(out + e0) = x;
-            }
+    if constexpr (std::is_same_v<Kind, bool>) {
+        for (unsigned q = 0; q < 8; q++)
+            store_bool_part<ALIGNED>(out, s, P, w, q);
+    } else {
+        O x[per_block];
+        block_values<Kind>(w, P, s, x);
+        if (ALIGNED && P >= s.p0 && P + 128u <= s.p1) {
+            store_wide<16>(out + (P - s.p0) / bits, x);
             return;
         }
-    }
-    for (unsigned k = 0; k < per_block; k++) {
-        uint64_t q = P + k * bits;
-        if (q >= s.p0 && q < s.p1)
-            out[(q - s.p0) / bits] = elem<Kind>::make(w, k, q / bits, s);
+        for (unsigned k = 0; k < per_block; k++) {
+            uint64_t q = P + k * bits;
+            if (q >= s.p0 && q < s.p1)
+                out[(q - s.p0) / bits] = x[k];
+        }
     }
 }
 
@@ -250,12 +317,19 @@ inline void tile_body(typename elem<Kind>::out_t *out, const Span &s, sycl::nd_i
             }
         }
         sycl::group_barrier(it.get_group());
-        for (unsigned slot = rank; slot < TILE_SLOTS; slot += TILE_ITEMS) {
+        /* A bool block is 128 output bytes, so consecutive work items take its 16-byte parts
+         * to keep the stores contiguous. */
+        constexpr unsigned parts = std::is_same_v<Kind, bool> ? 8 : 1;
+        for (unsigned u = rank; u < TILE_SLOTS * parts; u += TILE_ITEMS) {
+            unsigned slot = u / parts;
             unsigned sg = slot / (TILE_STEPS * 8), within = slot % (TILE_STEPS * 8);
             uint64_t P = ((gb + sg) * s.K + jb) * 1024u + within * 128u;
             if (P >= s.p1)
                 continue;
-            store_block<Kind, ALIGNED>(out, s, P, tile[slot].w);
+            if constexpr (std::is_same_v<Kind, bool>)
+                store_bool_part<ALIGNED>(out, s, P, tile[slot].w, u % parts);
+            else
+                store_block<Kind, ALIGNED>(out, s, P, tile[slot].w);
         }
         sycl::group_barrier(it.get_group());
     }
@@ -292,7 +366,7 @@ inline bool plan_span(Rng &rng, uint64_t n, unsigned align, unsigned bits, Span 
     s.key = rng.key();
     s.p0 = p0;
     s.p1 = p0 + n * bits;
-    s.range = 0;
+    s.range = s.thresh = 0;
     rng.set_position(s.p1);
     return n != 0;
 }
@@ -313,6 +387,10 @@ sycl::event fill_kind(sycl::queue &q, const Out &out, uint64_t n, Rng &rng, Kern
     if (!plan_span(rng, n, bits, bits, s))
         return sycl::event();
     s.range = range;
+    if constexpr (std::is_same_v<Kind, below32>)
+        s.thresh = below_threshold_u32((uint32_t)range);
+    else if constexpr (std::is_same_v<Kind, below64>)
+        s.thresh = below_threshold_u64(range);
     set_rows(s, s.p0 >> 7, (s.p1 - 1) >> 7);
     if (kernel == Kernel::Auto)
         kernel = q.get_device().is_cpu() ? Kernel::Chunk : Kernel::Tile;
@@ -359,10 +437,8 @@ template <class O> inline void store_pair(O *dst, bool wide, uint64_t n, uint64_
     if (2 * i + 1 >= n) {
         dst[2 * i] = z.z0;
     } else if (wide) {
-        struct alignas(2 * sizeof(O)) Two {
-            O v[2];
-        } two = {{z.z0, z.z1}};
-        *reinterpret_cast<Two *>(dst + 2 * i) = two;
+        const O two[2] = {z.z0, z.z1};
+        store_wide<2 * sizeof(O)>(dst + 2 * i, two);
     } else {
         dst[2 * i] = z.z0;
         dst[2 * i + 1] = z.z1;
@@ -402,10 +478,8 @@ inline void normal_body(O *dst, const Span &s, uint64_t ba, uint64_t bb, uint64_
         if (quad && 4u * (b - ba) + 4u <= n) {
             Pair2<float> z0 = normal_step_f32(to_f32(o[0]), to_f32(o[1]));
             Pair2<float> z1 = normal_step_f32(to_f32(o[2]), to_f32(o[3]));
-            struct alignas(16) Quad {
-                float v[4];
-            } q4 = {{z0.z0, z0.z1, z1.z0, z1.z1}};
-            *reinterpret_cast<Quad *>(dst + 4u * (b - ba)) = q4;
+            const float q4[4] = {z0.z0, z0.z1, z1.z0, z1.z1};
+            store_wide<16>(dst + 4u * (b - ba), q4);
             continue;
         }
         if (!STRADDLE) {

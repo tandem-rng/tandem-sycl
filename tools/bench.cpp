@@ -1,8 +1,10 @@
 // Fill throughput on the default SYCL device, GiB/s written. Each row runs eight back-to-back
 // fills on an in-order queue and one wait, after a half-second warm-up, and keeps the minimum
-// time of 15 runs. Every fill starts at position 0.
+// time of 15 runs. Every fill starts at position 0. An argument keeps the rows whose label
+// contains it.
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 
 #include <tandem/sycl.hpp>
@@ -27,7 +29,8 @@ static double best_gibs(sycl::queue &q, size_t bytes, const std::function<void()
     return (double)bytes * per_run / best / (1024.0 * 1024.0 * 1024.0);
 }
 
-int main() {
+int main(int argc, char **argv) {
+    const char *only = argc > 1 ? argv[1] : "";
     sycl::queue q{sycl::property::queue::in_order()};
     std::printf("device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
     const size_t max_n = (size_t)1 << 28;
@@ -51,6 +54,8 @@ int main() {
 
     std::printf("%-40s %10s %10s\n", "", "2^26", "2^28");
     auto row = [&](const char *label, size_t elem_bytes, auto body) {
+        if (!std::strstr(label, only))
+            return;
         std::printf("%-40s", label);
         for (size_t n : {(size_t)1 << 26, max_n})
             std::printf(" %10.0f", best_gibs(q, n * elem_bytes, [&] { body(n); }));
@@ -78,6 +83,12 @@ int main() {
     row("fill_below uint64_t, range 1000", 8, [&](size_t n) {
         tandem::Rng r = rng;
         tandem::fill_below(q, static_cast<uint64_t *>(buf), n, r, 1000u);
+    });
+    row("fill_below uint32_t, range 1000, chunk kernel", 4, [&](size_t n) {
+        tandem::Rng r = rng;
+        tandem::detail::fill_kind<tandem::detail::below32>(
+            q, tandem::detail::UsmOut<uint32_t>{static_cast<uint32_t *>(buf)}, n, r,
+            Kernel::Chunk, {}, 1000u);
     });
     row("fill_normal float", 4, [&](size_t n) {
         tandem::Rng r = rng;
