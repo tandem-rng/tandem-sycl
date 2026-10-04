@@ -39,8 +39,8 @@ struct Span {
 };
 
 /* How an output element is made from a block: element k of the block takes bits
- * [k bits, (k + 1) bits). `e` is its index in the fill, which the bounded kinds need for their
- * fallback stream. */
+ * [k bits, (k + 1) bits). `e` is its global draw index, which keys the bounded kinds' fallback
+ * stream (Appendix A of the specification), so a fill cut into pieces equals the whole fill. */
 template <class Kind> struct elem;
 
 template <> struct elem<bool> {
@@ -148,7 +148,7 @@ inline void store_block(typename elem<Kind>::out_t *out, const Span &s, uint64_t
                     O v[per_block];
                 } x;
                 for (unsigned k = 0; k < per_block; k++)
-                    x.v[k] = elem<Kind>::make(w, k, e0 + k, s);
+                    x.v[k] = elem<Kind>::make(w, k, P / bits + k, s);
                 *reinterpret_cast<Vec *>(out + e0) = x;
             }
             return;
@@ -156,10 +156,8 @@ inline void store_block(typename elem<Kind>::out_t *out, const Span &s, uint64_t
     }
     for (unsigned k = 0; k < per_block; k++) {
         uint64_t q = P + k * bits;
-        if (q >= s.p0 && q < s.p1) {
-            uint64_t e = (q - s.p0) / bits;
-            out[e] = elem<Kind>::make(w, k, e, s);
-        }
+        if (q >= s.p0 && q < s.p1)
+            out[(q - s.p0) / bits] = elem<Kind>::make(w, k, q / bits, s);
     }
 }
 
@@ -573,8 +571,9 @@ template <class E> struct below {
 /* Uniform integers on [0, range) in an unsigned 32- or 64-bit integer type, by Lemire's method
  * as Rng::urand(range). Element i takes draw i of the u32 (u64) fill and consumes exactly that
  * one draw, so the fill advances the position by 32 n (64 n) bits whatever the draws are. A
- * rejected draw retries on a fallback stream, see PURPOSE_BELOW32 in core.hpp. An empty fill
- * leaves the position alone. Not part of the specification. */
+ * rejected draw retries on the fallback stream split(g) of sub(PURPOSE_BELOW32) (or 64) of the
+ * key at position 0, g being the draw's global index, aligned start / 32 (64) + i. An empty fill
+ * leaves the position alone. Appendix A of the specification. */
 template <class E>
 sycl::event fill_below(sycl::queue &q, E *out, size_t n, Rng &rng, std::type_identity_t<E> range,
                        const std::vector<sycl::event> &deps = {}) {

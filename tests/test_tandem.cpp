@@ -612,9 +612,9 @@ static void test_buffers(sycl::queue &q) {
 
 // ---- Bounded and normal fills --------------------------------------------------------------
 
-// The contract in core.hpp, written out on host generators: element e takes draw e of the
-// fill, and a rejected draw retries on the draws of split(e) of sub(PURPOSE_BELOW) of the
-// fill's generator at position 0.
+// Appendix A of the specification, written out on host generators: element i takes draw i of
+// the fill, and a rejected draw retries on the draws of split(g) of sub(PURPOSE_BELOW) of the
+// fill's generator at position 0, g = aligned start / width + i.
 static uint32_t ref_below32(const Key &key, uint32_t K, uint32_t u, uint32_t range, uint64_t e) {
     uint64_t m = (uint64_t)u * range;
     if ((uint32_t)m < range) {
@@ -673,7 +673,7 @@ template <class E> static void check_below(sycl::queue &q, const char *label) {
             uint64_t p0 = tandem::align_pos(t.pos, 8 * sizeof(E));
             std::vector<E> want(t.n);
             for (size_t i = 0; i < t.n; i++)
-                want[i] = ref_below<E>(t.key, t.K, draws[i], range, i);
+                want[i] = ref_below<E>(t.key, t.K, draws[i], range, p0 / (8 * sizeof(E)) + i);
             for (Kernel kernel : KERNELS) {
                 uint64_t end;
                 auto got = device_below<E>(q, t.key, t.pos, t.K, t.n, range, kernel, t.shift,
@@ -689,10 +689,51 @@ template <class E> static void check_below(sycl::queue &q, const char *label) {
     }
 }
 
-// Without a rejection a bounded fill equals the sequential urand(range) calls, and fixtures from
-// tandem-cuda pin the fallback stream: 41 of the 2^31 + 1 elements and 34 of the 2^63 + 1
-// elements reject.
+// A fill cut at an element boundary equals the whole fill, rejected draws included, at
+// unaligned nonzero starts with ranges that reject about a quarter of the draws.
+template <class E> static void check_below_cut(sycl::queue &q) {
+    constexpr size_t n = 300;
+    const E range = (E)3 << (8 * sizeof(E) - 2) | 1u;
+    const Key key = Rng(5, 6).key();
+    for (uint64_t start : {1ull, 12345ull, 100000ull})
+        for (size_t cut : {1, 7, 100, 299})
+            for (Kernel kernel : KERNELS) {
+                uint64_t end_whole, end_a, end_b;
+                auto whole = device_below<E>(q, key, start, 32, n, range, kernel, 0, &end_whole);
+                auto a = device_below<E>(q, key, start, 32, cut, range, kernel, 0, &end_a);
+                auto b = device_below<E>(q, key, end_a, 32, n - cut, range, kernel, 0, &end_b);
+                a.insert(a.end(), b.begin(), b.end());
+                CHECK(first_diff(whole, a) == SIZE_MAX && end_whole == end_b);
+            }
+}
+
+// Without a rejection a bounded fill equals the sequential urand(range) calls. Fixtures from
+// tandem-cuda pin the fallback stream at position 0, where 41 of the 2^31 + 1 elements and 34
+// of the 2^63 + 1 elements reject, and at bit positions 1 and 12345, where g != i.
 static void test_below(sycl::queue &q) {
+    check_below_cut<uint32_t>(q);
+    check_below_cut<uint64_t>(q);
+    unsigned rejected = 0;
+    for (const auto &f : CROSS_BELOW32_AT)
+        for (Kernel kernel : KERNELS) {
+            uint64_t end;
+            auto v = device_below<uint32_t>(q, Rng(42).key(), f.start, 32, 64, f.range, kernel,
+                                            0, &end);
+            CHECK(std::memcmp(v.data(), f.out, sizeof f.out) == 0 &&
+                  end == tandem::align_pos(f.start, 32) + 64 * 32);
+            rejected += f.rejected;
+        }
+    for (const auto &f : CROSS_BELOW64_AT)
+        for (Kernel kernel : KERNELS) {
+            uint64_t end;
+            auto v = device_below<uint64_t>(q, Rng(42).key(), f.start, 32, 64, f.range, kernel,
+                                            0, &end);
+            CHECK(std::memcmp(v.data(), f.out, sizeof f.out) == 0 &&
+                  end == tandem::align_pos(f.start, 64) + 64 * 64);
+            rejected += f.rejected;
+        }
+    CHECK(rejected > 0);
+
     check_below<uint32_t>(q, "u32");
     check_below<uint64_t>(q, "u64");
 
