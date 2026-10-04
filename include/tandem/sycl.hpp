@@ -399,26 +399,75 @@ sycl::event fill_kind(sycl::queue &q, const Out &out, uint64_t n, Rng &rng, Kern
     return fill_chunk<Kind>(q, s, out, deps);
 }
 
-/* The float Box-Muller step of the fill. sycl::sincos takes the angle shifted by half a turn,
- * which lies in [-pi, pi) and is rounded half as coarsely as 2 pi b, and both halves change
- * sign. This keeps the fill in float on devices without double precision, within 16 ulps + 1e-6
- * of box_muller2_f32. Define TANDEM_PRECISE_F32_NORMAL for box_muller2_f32 itself. */
+/* The float Box-Muller step of the fills. The radius takes the logarithm of normal_block_f32 in
+ * core.hpp with a native reciprocal, the angle the native cos and sin, as tandem-cuda takes
+ * __sincosf, shifted by half a turn into [-pi, pi), where they are accurate, with both halves
+ * negated. Library logf and sincos would make the fill compute bound on GPUs. The step stays in
+ * float on devices without double precision, within 16 ulps + 1e-6 of box_muller2_f32. Define
+ * TANDEM_PRECISE_F32_NORMAL for box_muller2_f32 itself. */
 inline Pair2<float> normal_step_f32(float a, float b) {
 #if defined(TANDEM_PRECISE_F32_NORMAL)
     return box_muller2_f32(a, b);
 #else
-    float r = sycl::sqrt(-2.0f * sycl::log(1.0f - a)), c;
-    float s = sycl::sincos(6.2831853071795864769f * (b - 0.5f), &c);
-    return Pair2<float>{-r * c, -r * s};
+    TANDEM_FP_NOCONTRACT
+    float x = 1.0f - a;
+    uint32_t ix = std::bit_cast<uint32_t>(x) + 0x004afb0du;
+    float nk = (float)(127 - (int32_t)(ix >> 23));
+    float mant = std::bit_cast<float>((ix & 0x007fffffu) + 0x3f3504f3u);
+    /* A native reciprocal and one Newton step: some native divides are good to 12 bits only. */
+    float den = mant + 1.0f, y = sycl::native::recip(den);
+    y = sycl::fma(y, sycl::fma(-den, y, 1.0f), y);
+    float s = (mant - 1.0f) * y, zz = s * s;
+    float p = sycl::fma(zz, 0.14275366f, 0.20000061f);
+    p = sycl::fma(zz, p, 0.33333334f);
+    p = sycl::fma(zz, p, 1.0f);
+    float r = sycl::sqrt(
+        sycl::fma(nk, 2.857213530660374e-06f, sycl::fma(nk, 1.38629150390625f, (s * -4.0f) * p)));
+    float t = 6.2831853071795864769f * (b - 0.5f);
+    return Pair2<float>{-r * sycl::native::cos(t), -r * sycl::native::sin(t)};
 #endif
 }
 
-/* The double step. core.hpp's box_muller2 is the host polynomial outside CUDA and HIP, an out
- * of line call per pair, so a kernel takes the device's log and sincos instead. */
+/* The double step: the arithmetic of normal_block_f64 in core.hpp on one pair, inline, with its
+ * fused multiply-adds and IEEE division and square root, so the double fills equal the host's
+ * Rng::normal2 bit for bit. Its logarithm and quarter-turn polynomials need no range reduction,
+ * which makes the fill memory bound on GPUs where library log and sincos are not. core.hpp's
+ * box_muller2 is that body out of line outside CUDA and HIP, a call per pair in a kernel. */
 inline Pair2<double> normal_step_f64(double a, double b) {
-    double r = sycl::sqrt(-2.0 * sycl::log(1.0 - a)), c;
-    double s = sycl::sincos(6.283185307179586 * b, &c);
-    return Pair2<double>{r * c, r * s};
+    TANDEM_FP_NOCONTRACT
+    double x = 1.0 - a;
+    uint64_t ix = std::bit_cast<uint64_t>(x) + 0x00095f6200000000u;
+    double nk = (double)(1023 - (int32_t)(ix >> 52));
+    double mant = std::bit_cast<double>((ix & 0x000fffffffffffffu) + 0x3fe6a09e00000000u);
+    double s = (mant - 1.0) / (mant + 1.0), zz = s * s;
+    /* Horner steps in the order of normal_block_f64, so the bits match. */
+    double p = sycl::fma(zz, 0.08312363319426472, 0.09070001083303751);
+    p = sycl::fma(zz, p, 0.11111433317907482);
+    p = sycl::fma(zz, p, 0.14285712049336274);
+    p = sycl::fma(zz, p, 0.2000000000566491);
+    p = sycl::fma(zz, p, 0.33333333333331017);
+    p = sycl::fma(zz, p, 1.0);
+    double r = sycl::sqrt(
+        sycl::fma(nk, 3.816429394731813e-10, sycl::fma(nk, 1.3862943607382476, (s * -4.0) * p)));
+    int32_t q = (int32_t)(b * 4.0 + 0.5);
+    double f = sycl::fma(-(double)q, 0.25, b), th = f * 6.283185307179586, w = th * th;
+    double hs = sycl::fma(w, 1.5914650986900946e-10, -2.5051097984389413e-08);
+    hs = sycl::fma(w, hs, 2.755731600073921e-06);
+    hs = sycl::fma(w, hs, -0.00019841269836630226);
+    hs = sycl::fma(w, hs, 0.008333333333330813);
+    hs = sycl::fma(w, hs, -0.16666666666666669);
+    double hc = sycl::fma(w, 2.0665708703855164e-09, -2.7555858522576447e-07);
+    hc = sycl::fma(w, hc, 2.480158263811954e-05);
+    hc = sycl::fma(w, hc, -0.0013888888882156126);
+    hc = sycl::fma(w, hc, 0.04166666666663108);
+    hc = sycl::fma(w, hc, -0.4999999999999997);
+    double sn = th * sycl::fma(w, hs, 1.0), cs = sycl::fma(w, hc, 1.0);
+    uint64_t qu = (uint64_t)(int64_t)q, sm = (uint64_t)0 - (qu & 1u);
+    uint64_t sb = std::bit_cast<uint64_t>(sn), cb = std::bit_cast<uint64_t>(cs);
+    uint64_t xb = (sb & sm) | (cb & ~sm), yb = (cb & sm) | (sb & ~sm);
+    xb ^= ((qu + 1u) << 62) & 0x8000000000000000u;
+    yb ^= (qu << 62) & 0x8000000000000000u;
+    return Pair2<double>{r * std::bit_cast<double>(xb), r * std::bit_cast<double>(yb)};
 }
 
 /* The normal pair of the uniforms in the words v: two Float64 draws (four words) or two Float32
@@ -672,9 +721,9 @@ sycl::event fill_below(sycl::queue &q, sycl::buffer<E, D> &buf, Rng &rng,
  * or Rng::normal2 calls: pair j, the elements 2j and 2j + 1 with the cos half first, is made from
  * the draws 2j and 2j + 1 of the f32 or f64 fill. An odd count drops the last sin half and still
  * consumes both draws, so the fill takes 64 (float) or 128 (double) bits per pair. An empty fill
- * leaves the position alone. Device and host trigonometry differ in the last bits, so normals
- * agree with other ports to 16 ulps + 1e-6 (float) and 1e-12 relative (double), not bit for
- * bit. Not part of the specification. */
+ * leaves the position alone. Double normals equal Rng::normal2 on the host bit for bit on the
+ * tested devices. Float normals take native cos and sin and agree with other ports to 16 ulps +
+ * 1e-6. Appendix A of the specification. */
 template <class E>
 sycl::event fill_normal(sycl::queue &q, E *out, size_t n, Rng &rng,
                         const std::vector<sycl::event> &deps = {}) {

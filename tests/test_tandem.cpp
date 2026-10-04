@@ -803,6 +803,10 @@ template <class E> static void check_normal(sycl::queue &q, const char *label) {
         if (!ok)
             std::printf("  %s normal (K=%u pos=%llu n=%zu shift=%zu)\n", label, t.K,
                         (unsigned long long)t.pos, t.n, t.shift);
+        /* The double step is the host's arithmetic with explicit fused multiply-adds and IEEE
+         * division and square root, so it matches bit for bit on every tested device. */
+        if constexpr (std::is_same_v<E, double>)
+            CHECK(std::memcmp(got.data(), want.data(), t.n * sizeof(E)) == 0);
     }
 }
 

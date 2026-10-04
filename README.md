@@ -87,15 +87,18 @@ Signed integers hold the two's complement of the unsigned draw of the same width
 value takes two draws, the real and then the imaginary component.
 
 Bounded and normal draws are not part of the specification. They follow its Appendix A, the
-contract in `core.hpp`, and the same fills in tandem-c, tandem-cuda and tandem-kokkos. The
-normal fills take the device's `log` and `sincos`. `Rng::normal` and its siblings take the
-polynomial Box-Muller of `core.hpp`, the arithmetic of tandem-c's host fills, on the host and
-in kernels. Device `log` and `sincos` differ from it in the last bits, so normals agree with
-the other ports to 16 ulps plus 1e-6 for `float` and 1e-12 relative for `double`, not bit for
-bit. The float normal fill takes its angle through `sycl::sincos` in single precision, shifted
-by half a turn into `[-pi, pi)`, so it needs no double precision on the device. Define
-`TANDEM_PRECISE_F32_NORMAL` for `box_muller2_f32` from `core.hpp` instead. Double fills and
-`Rng::normal` need a device with `aspect::fp64`, `Rng::normalf` does not.
+contract in `core.hpp`, and the same fills in tandem-c, tandem-cuda and tandem-kokkos.
+`Rng::normal` and its siblings take the polynomial Box-Muller of `core.hpp`, the arithmetic of
+tandem-c's host fills, on the host and in kernels. The double normal fill takes the same
+arithmetic inline, with fused multiply-adds and IEEE division and square root, so it equals
+`Rng::normal2` bit for bit on every tested device. The float normal fill takes the logarithm
+of that arithmetic with a native reciprocal and one Newton step, and the fast
+`sycl::native::cos` and `sin`, as tandem-cuda takes `__sincosf`, with the angle shifted by half
+a turn into `[-pi, pi)`. It needs no double precision on the device. Float normals agree with
+the other ports to 16 ulps plus 1e-6, and double normals with tandem-cuda's device fills to
+1e-12 relative. Define `TANDEM_PRECISE_F32_NORMAL` for `box_muller2_f32` from `core.hpp`
+instead. Double fills and `Rng::normal` need a device with `aspect::fp64`, `Rng::normalf` does
+not.
 
 ## Kernels
 
