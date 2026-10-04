@@ -228,11 +228,13 @@ inline void store_block(typename elem<Kind>::out_t *out, const Span &s, uint64_t
     }
 }
 
-/* Auto is Tile on GPUs and other accelerators with K >= 8, else Chunk. */
+/* Auto is Tile on GPUs and other accelerators, else Chunk. The uniform and bounded fills take
+ * Chunk for K < 8. */
 enum class Kernel {
     Auto,
     Chunk, /* one work item per chunk, one block per step */
-    Tile,  /* one work group per 32 groups, eight steps staged in local memory */
+    Tile,  /* one work group per 32 groups: eight steps staged in local memory, or for normal
+            * fills the units of each row passed between lanes */
 };
 
 /* The output of a fill as the kernel sees it. A USM pointer is used as is. A buffer is bound
@@ -400,11 +402,11 @@ sycl::event fill_kind(sycl::queue &q, const Out &out, uint64_t n, Rng &rng, Kern
 }
 
 /* The float Box-Muller step of the fills. The radius takes the logarithm of normal_block_f32 in
- * core.hpp with a native reciprocal, the angle the native cos and sin, as tandem-cuda takes
- * __sincosf, shifted by half a turn into [-pi, pi), where they are accurate, with both halves
- * negated. Library logf and sincos would make the fill compute bound on GPUs. The step stays in
- * float on devices without double precision, within 16 ulps + 1e-6 of box_muller2_f32. Define
- * TANDEM_PRECISE_F32_NORMAL for box_muller2_f32 itself. */
+ * core.hpp, the angle the native cos and sin, as tandem-cuda takes __sincosf, shifted by half a
+ * turn into [-pi, pi), where they are accurate, with both halves negated. Library logf and
+ * sincos would make the fill compute bound on GPUs. The step stays in float on devices without
+ * double precision, within 16 ulps + 1e-6 of box_muller2_f32. Define TANDEM_PRECISE_F32_NORMAL
+ * for box_muller2_f32 itself. */
 inline Pair2<float> normal_step_f32(float a, float b) {
 #if defined(TANDEM_PRECISE_F32_NORMAL)
     return box_muller2_f32(a, b);
@@ -414,10 +416,7 @@ inline Pair2<float> normal_step_f32(float a, float b) {
     uint32_t ix = std::bit_cast<uint32_t>(x) + 0x004afb0du;
     float nk = (float)(127 - (int32_t)(ix >> 23));
     float mant = std::bit_cast<float>((ix & 0x007fffffu) + 0x3f3504f3u);
-    /* A native reciprocal and one Newton step: some native divides are good to 12 bits only. */
-    float den = mant + 1.0f, y = sycl::native::recip(den);
-    y = sycl::fma(y, sycl::fma(-den, y, 1.0f), y);
-    float s = (mant - 1.0f) * y, zz = s * s;
+    float s = (mant - 1.0f) / (mant + 1.0f), zz = s * s;
     float p = sycl::fma(zz, 0.14275366f, 0.20000061f);
     p = sycl::fma(zz, p, 0.33333334f);
     p = sycl::fma(zz, p, 1.0f);
@@ -428,53 +427,14 @@ inline Pair2<float> normal_step_f32(float a, float b) {
 #endif
 }
 
-/* The double step: the arithmetic of normal_block_f64 in core.hpp on one pair, inline, with its
- * fused multiply-adds and IEEE division and square root, so the double fills equal the host's
- * Rng::normal2 bit for bit. Its logarithm and quarter-turn polynomials need no range reduction,
- * which makes the fill memory bound on GPUs where library log and sincos are not. core.hpp's
- * box_muller2 is that body out of line outside CUDA and HIP, a call per pair in a kernel. */
-inline Pair2<double> normal_step_f64(double a, double b) {
-    TANDEM_FP_NOCONTRACT
-    double x = 1.0 - a;
-    uint64_t ix = std::bit_cast<uint64_t>(x) + 0x00095f6200000000u;
-    double nk = (double)(1023 - (int32_t)(ix >> 52));
-    double mant = std::bit_cast<double>((ix & 0x000fffffffffffffu) + 0x3fe6a09e00000000u);
-    double s = (mant - 1.0) / (mant + 1.0), zz = s * s;
-    /* Horner steps in the order of normal_block_f64, so the bits match. */
-    double p = sycl::fma(zz, 0.08312363319426472, 0.09070001083303751);
-    p = sycl::fma(zz, p, 0.11111433317907482);
-    p = sycl::fma(zz, p, 0.14285712049336274);
-    p = sycl::fma(zz, p, 0.2000000000566491);
-    p = sycl::fma(zz, p, 0.33333333333331017);
-    p = sycl::fma(zz, p, 1.0);
-    double r = sycl::sqrt(
-        sycl::fma(nk, 3.816429394731813e-10, sycl::fma(nk, 1.3862943607382476, (s * -4.0) * p)));
-    int32_t q = (int32_t)(b * 4.0 + 0.5);
-    double f = sycl::fma(-(double)q, 0.25, b), th = f * 6.283185307179586, w = th * th;
-    double hs = sycl::fma(w, 1.5914650986900946e-10, -2.5051097984389413e-08);
-    hs = sycl::fma(w, hs, 2.755731600073921e-06);
-    hs = sycl::fma(w, hs, -0.00019841269836630226);
-    hs = sycl::fma(w, hs, 0.008333333333330813);
-    hs = sycl::fma(w, hs, -0.16666666666666669);
-    double hc = sycl::fma(w, 2.0665708703855164e-09, -2.7555858522576447e-07);
-    hc = sycl::fma(w, hc, 2.480158263811954e-05);
-    hc = sycl::fma(w, hc, -0.0013888888882156126);
-    hc = sycl::fma(w, hc, 0.04166666666663108);
-    hc = sycl::fma(w, hc, -0.4999999999999997);
-    double sn = th * sycl::fma(w, hs, 1.0), cs = sycl::fma(w, hc, 1.0);
-    uint64_t qu = (uint64_t)(int64_t)q, sm = (uint64_t)0 - (qu & 1u);
-    uint64_t sb = std::bit_cast<uint64_t>(sn), cb = std::bit_cast<uint64_t>(cs);
-    uint64_t xb = (sb & sm) | (cb & ~sm), yb = (cb & sm) | (sb & ~sm);
-    xb ^= ((qu + 1u) << 62) & 0x8000000000000000u;
-    yb ^= (qu << 62) & 0x8000000000000000u;
-    return Pair2<double>{r * std::bit_cast<double>(xb), r * std::bit_cast<double>(yb)};
-}
-
 /* The normal pair of the uniforms in the words v: two Float64 draws (four words) or two Float32
- * draws (two words). */
+ * draws (two words). The double step is core.hpp's normal_pair_f64, inline, the host's
+ * polynomial arithmetic with explicit fused multiply-adds, so double fills equal Rng::normal2 on
+ * the host bit for bit, and its polynomials need no range reduction, which keeps the fill near
+ * memory speed on GPUs. */
 template <class O> inline Pair2<O> normal_pair(const uint32_t *v) {
     if constexpr (std::is_same_v<O, double>)
-        return normal_step_f64(to_f64(v[0] | ((uint64_t)v[1] << 32)),
+        return normal_pair_f64(to_f64(v[0] | ((uint64_t)v[1] << 32)),
                                to_f64(v[2] | ((uint64_t)v[3] << 32)));
     else
         return normal_step_f32(to_f32(v[0]), to_f32(v[1]));
@@ -566,9 +526,188 @@ inline void normal_body(O *dst, const Span &s, uint64_t ba, uint64_t bb, uint64_
     }
 }
 
+/* Unit u of a normal fill from its four words: two float pairs or one double pair, 16 output
+ * bytes at element 4u (float) or 2u (double). */
+template <class O>
+inline void normal_unit(O *dst, bool wide, uint64_t n, uint64_t u, const uint32_t w[4]) {
+    constexpr unsigned E = std::is_same_v<O, double> ? 2u : 4u;
+    O z[E];
+    for (unsigned k = 0; k < E; k += 2) {
+        Pair2<O> p = normal_pair<O>(w + (E == 2 ? 0u : k));
+        z[k] = p.z0;
+        z[k + 1] = p.z1;
+    }
+    O *d = dst + E * u;
+    if (wide && E * u + E <= n) {
+        store_wide<16>(d, z);
+    } else {
+        for (unsigned k = 0; k < E; k++)
+            if (E * u + k < n)
+                d[k] = z[k];
+    }
+}
+
+/* The local memory of normal_group_body: two steps of the blocks passed between lanes when
+ * sub-groups cannot shuffle them, then the first row of each group and of the group after the
+ * work group. A start at a block of lane 0 needs none, and less local memory lets more work
+ * groups share a compute unit. */
+constexpr unsigned NGROUP_XBUF = 2 * TILE_ITEMS, NGROUP_FIRST = TILE_ITEMS + 8;
+template <bool SHIFTED, bool SHUFFLE>
+constexpr unsigned ngroup_blocks = !SHIFTED  ? 1u
+                                   : SHUFFLE ? NGROUP_FIRST
+                                             : NGROUP_XBUF + NGROUP_FIRST;
+
+/* Normal fill for any start, each work item stepping only its own chunk. The fill is cut into
+ * units of four 32-bit words from its first word S: unit u is two float pairs or one double
+ * pair, 16 output bytes at element 4u (float) or 2u (double), and starts at word KW = S % 4 of
+ * block B0 + u, B0 = S / 4. Lane l of a group writes unit 8m + l of octet m, so the eight lanes
+ * write 128 aligned bytes whatever the start. With d = B0 % 8 the octet's units start in row R
+ * from lane d on and in row R + 1 below lane d, and each ends in the next block. So a group
+ * writes the octet of row R one step later, when row R + 1 is out. Each step every lane takes
+ * word t of the new row from lane la (t >= KW, its unit's first block) or lb (t < KW, its
+ * second), by sub-group shuffles with SHUFFLE, else through local memory with a barrier per
+ * step, and keeps what it took the step before, which is row R. The octet of a group's last row
+ * takes the next group's first row, kept from step 0, or for the group after the work group
+ * computed in one step. KW and SHIFTED (KW != 0 or d != 0) are template parameters because
+ * shifts by a runtime KW, or both paths in one kernel, cost a sixth of the float fill's speed. */
+template <class O, unsigned KW, bool SHIFTED, bool SHUFFLE>
+inline void normal_group_body(O *dst, const Span &s, sycl::nd_item<1> it, Block *lm) {
+    constexpr unsigned E = std::is_same_v<O, double> ? 2u : 4u;
+    Block *first = lm + (SHUFFLE ? 0u : NGROUP_XBUF);
+    const uint64_t S = s.p0 >> 5, n = s.range, units = (n + E - 1u) / E, end = S + 4u * units;
+    const uint64_t B0 = S >> 2, R0 = B0 >> 3; /* octet m lies at rows R0 + m and R0 + m + 1 */
+    const unsigned d = (unsigned)(B0 & 7u);
+    const bool wide = (reinterpret_cast<uintptr_t>(dst) & 15u) == 0;
+    const uint64_t gb = s.g0 + (uint64_t)it.get_group(0) * TILE_GROUPS;
+    const unsigned rank = (unsigned)it.get_local_id(0), gi = rank >> 3, lane = rank & 7u;
+    const uint64_t g = gb + gi;
+    const bool mine = g <= s.g1;
+    /* The lanes of this lane's unit's first and second block, and whether each lies in R + 1. */
+    const unsigned la = (d + lane) & 7u, lb = (d + lane + 1u) & 7u;
+    const bool na = d + lane >= 8u, nb = d + lane + 1u >= 8u;
+    uint32_t o[4], h[4];
+    F_keyed(s.key.w, 8u * g + lane, DOMAIN_STREAM, AUX_STREAM, o, h);
+    if (SHIFTED && rank < 8u)
+        block(s.key.w, 8u * (gb + TILE_GROUPS) + rank, 0, first[TILE_ITEMS + rank].w);
+
+    /* Unit 8 (R - R0) + lane: word t is word (t + KW) % 4 of its first block (t + KW < 4) or of
+     * its second, taken from row R + 1 (late) or row R (early). */
+    auto emit = [&](uint64_t R, const uint32_t *late, const uint32_t *early) {
+        if (R < R0 || 8u * (R - R0) + lane >= units)
+            return;
+        uint32_t w[4];
+        for (unsigned t = 0; t < 4; t++) {
+            const unsigned k = (t + KW) & 3u;
+            w[t] = (t + KW < 4u ? na : nb) ? late[k] : early[k];
+        }
+        normal_unit<O>(dst, wide, n, 8u * (R - R0) + lane, w);
+    };
+    /* Word t of the block of lane la (t >= KW) or lb (t < KW). Every work item calls it. */
+    auto fetch = [&](unsigned buf, uint32_t *x) {
+        if constexpr (SHUFFLE) {
+            (void)buf;
+            auto sg = it.get_sub_group();
+            unsigned base = (unsigned)sg.get_local_linear_id() - lane;
+            for (unsigned t = 0; t < 4; t++)
+                x[t] = sycl::select_from_group(sg, o[t], base + (t >= KW ? la : lb));
+        } else {
+            Block *xa = lm + buf * TILE_ITEMS;
+            xa[rank] = Block{{o[0], o[1], o[2], o[3]}};
+            sycl::group_barrier(it.get_group());
+            for (unsigned t = 0; t < 4; t++)
+                x[t] = xa[rank - lane + (t >= KW ? la : lb)].w[t];
+        }
+    };
+
+    /* Whether step j has a row in the fill, the same for the whole work group. */
+    auto live = [&](uint32_t j) { return j < s.K && (gb * s.K + j) * 32u < end; };
+    if constexpr (!SHIFTED) {
+        /* Units are the blocks themselves. */
+        for (uint32_t j = 0; live(j); j++)
+            if (mine) {
+                T(o, h);
+                emit(g * s.K + j, o, o);
+            }
+    } else {
+        /* Step 0 is peeled so that the loop holds no test for it. */
+        uint32_t j = 0, prev[4] = {0, 0, 0, 0};
+        if (live(0)) {
+            if (mine)
+                T(o, h);
+            first[gi * 8u + lane] = Block{{o[0], o[1], o[2], o[3]}};
+            fetch(0, prev);
+            for (j = 1; live(j); j++) {
+                if (mine)
+                    T(o, h);
+                uint32_t cur[4];
+                fetch(j & 1u, cur);
+                if (mine)
+                    emit(g * s.K + j - 1u, cur, prev);
+                for (unsigned t = 0; t < 4; t++)
+                    prev[t] = cur[t];
+            }
+        }
+        /* The octet of the last row stepped. Its row R + 1 is the next group's first row after
+         * a whole group, and after a loop cut short lies past the fill, so the units that need
+         * it are past the fill too. */
+        sycl::group_barrier(it.get_group());
+        const Block *next = first + (gi + 1u) * 8u;
+        uint32_t cur[4];
+        for (unsigned t = 0; t < 4; t++)
+            cur[t] = next[t >= KW ? la : lb].w[t];
+        if (mine && j > 0)
+            emit(g * s.K + j - 1u, cur, prev);
+    }
+}
+
+/* How normal_group_body passes blocks between lanes. Auto takes shuffles on devices whose
+ * sub-group sizes are all multiples of eight, so that a sub-group holds whole groups. */
+enum class Exchange { Auto, Shuffle, Local };
+
+inline bool subgroups_hold_groups(const sycl::device &dev) {
+    auto sizes = dev.get_info<sycl::info::device::sub_group_sizes>();
+    for (size_t z : sizes)
+        if (z % 8u != 0)
+            return false;
+    return !sizes.empty();
+}
+
+template <class O, unsigned KW, bool SHIFTED, bool SHUFFLE, class Out>
+sycl::event fill_normal_group_kw(sycl::queue &q, const Span &s, const Out &out,
+                                 const std::vector<sycl::event> &deps) {
+    uint64_t teams = (s.g1 - s.g0 + TILE_GROUPS) / TILE_GROUPS;
+    return q.submit([&](sycl::handler &h) {
+        h.depends_on(deps);
+        auto dst = bind(out, h);
+        sycl::local_accessor<Block, 1> lm(sycl::range<1>(ngroup_blocks<SHIFTED, SHUFFLE>), h);
+        h.parallel_for(sycl::nd_range<1>(teams * TILE_ITEMS, TILE_ITEMS), [=](sycl::nd_item<1> it) {
+            normal_group_body<O, KW, SHIFTED, SHUFFLE>(
+                dst.get(), s, it, lm.template get_multi_ptr<sycl::access::decorated::no>().get());
+        });
+    });
+}
+
+template <class O, bool SHUFFLE, class Out>
+sycl::event fill_normal_group(sycl::queue &q, const Span &s, const Out &out,
+                              const std::vector<sycl::event> &deps) {
+    switch ((s.p0 >> 5) & 3u) {
+    case 0:
+        if (((s.p0 >> 7) & 7u) == 0)
+            return fill_normal_group_kw<O, 0, false, SHUFFLE>(q, s, out, deps);
+        return fill_normal_group_kw<O, 0, true, SHUFFLE>(q, s, out, deps);
+    case 1:
+        return fill_normal_group_kw<O, 1, true, SHUFFLE>(q, s, out, deps);
+    case 2:
+        return fill_normal_group_kw<O, 2, true, SHUFFLE>(q, s, out, deps);
+    default:
+        return fill_normal_group_kw<O, 3, true, SHUFFLE>(q, s, out, deps);
+    }
+}
+
 template <class O, class Out>
 sycl::event fill_normal_kind(sycl::queue &q, const Out &out, uint64_t n, Rng &rng,
-                             const std::vector<sycl::event> &deps) {
+                             const std::vector<sycl::event> &deps, Kernel kernel = Kernel::Auto,
+                             Exchange exchange = Exchange::Auto) {
     constexpr unsigned L = std::is_same_v<O, double> ? 4u : 2u;
     if (n == 0) /* no draws, so no alignment either */
         return sycl::event();
@@ -578,6 +717,17 @@ sycl::event fill_normal_kind(sycl::queue &q, const Out &out, uint64_t n, Rng &rn
     s.range = n;
     uint64_t S = s.p0 >> 5, ba = (S + L - 1u) >> 2, bb = (S + pairs * L - 1u) >> 2;
     set_rows(s, ba, bb);
+    if (kernel == Kernel::Auto)
+        kernel = q.get_device().is_cpu() ? Kernel::Chunk : Kernel::Tile;
+    if (kernel == Kernel::Tile) {
+        /* The units cover the blocks from the fill's first word to the last unit's last. */
+        constexpr unsigned E = L == 4 ? 2u : 4u;
+        set_rows(s, S >> 2, (S + 4u * ((n + E - 1u) / E) - 1u) >> 2);
+        if (exchange == Exchange::Shuffle ||
+            (exchange == Exchange::Auto && subgroups_hold_groups(q.get_device())))
+            return fill_normal_group<O, true>(q, s, out, deps);
+        return fill_normal_group<O, false>(q, s, out, deps);
+    }
     bool straddle = S % L != 0;
     return q.submit([&](sycl::handler &h) {
         h.depends_on(deps);

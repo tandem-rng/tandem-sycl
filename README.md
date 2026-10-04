@@ -86,19 +86,17 @@ q.parallel_for(sycl::range<1>(m), {e1, e2}, [=](sycl::id<1> i) {
 Signed integers hold the two's complement of the unsigned draw of the same width. A complex
 value takes two draws, the real and then the imaginary component.
 
-Bounded and normal draws are not part of the specification. They follow its Appendix A, the
-contract in `core.hpp`, and the same fills in tandem-c, tandem-cuda and tandem-kokkos.
-`Rng::normal` and its siblings take the polynomial Box-Muller of `core.hpp`, the arithmetic of
-tandem-c's host fills, on the host and in kernels. The double normal fill takes the same
-arithmetic inline, with fused multiply-adds and IEEE division and square root, so it equals
-`Rng::normal2` bit for bit on every tested device. The float normal fill takes the logarithm
-of that arithmetic with a native reciprocal and one Newton step, and the fast
-`sycl::native::cos` and `sin`, as tandem-cuda takes `__sincosf`, with the angle shifted by half
-a turn into `[-pi, pi)`. It needs no double precision on the device. Float normals agree with
-the other ports to 16 ulps plus 1e-6, and double normals with tandem-cuda's device fills to
-1e-12 relative. Define `TANDEM_PRECISE_F32_NORMAL` for `box_muller2_f32` from `core.hpp`
-instead. Double fills and `Rng::normal` need a device with `aspect::fp64`, `Rng::normalf` does
-not.
+Bounded and normal draws follow Appendix A of the specification, the contract in `core.hpp`,
+and the same fills in tandem-c, tandem-cuda and tandem-kokkos. `Rng::normal` and its siblings
+take the polynomial Box-Muller of `core.hpp`, the arithmetic of tandem-c's host fills, on the
+host and in kernels. The double normal fill takes the same arithmetic inline, with fused
+multiply-adds and IEEE division and square root, so it equals `Rng::normal2` and tandem-cuda's
+fills bit for bit on every tested device. The float normal fill takes the logarithm of that
+arithmetic and the fast `sycl::native::cos` and `sin`, as tandem-cuda takes `__sincosf`, with
+the angle shifted by half a turn into `[-pi, pi)`. It needs no double precision on the device.
+Float normals agree with the other ports to 16 ulps plus 1e-6. Define
+`TANDEM_PRECISE_F32_NORMAL` for `box_muller2_f32` from `core.hpp` instead. Double fills and
+`Rng::normal` need a device with `aspect::fp64`, `Rng::normalf` does not.
 
 ## Kernels
 
@@ -108,6 +106,18 @@ contiguous bytes per 32 items. On CPU devices, and for smaller `K`, each item st
 directly. Both store whole 16-byte blocks when the output's blocks are 16-byte aligned, which a
 kernel checks on the device, so USM and buffer outputs share one path. A bool block is 128
 bytes and leaves as eight 16-byte stores.
+
+On GPUs the normal fill cuts the stream into units of four 32-bit words from the fill's first
+word, two float pairs or one double pair, each one 16-byte store. Each work item steps only
+its own chunk, and the eight lanes of a group write eight consecutive units, 128 aligned bytes,
+one step after their rows are out. When the start is not a multiple of 32 words, a unit's
+words lie in two blocks held by other lanes, which pass them by sub-group shuffles. The units
+that end in the next group take its first row, kept from step 0, or for the group after the
+work group computed in one step. So any start costs at most about a tenth more. The word
+offset within a block is a template parameter, four kernels per type. Devices whose sub-group
+sizes are not all multiples of eight pass the blocks through local memory with a barrier per
+step instead. On CPU devices each item writes the pairs that end in its blocks, stepping the
+previous chunk as well at such starts.
 
 ## Build
 
@@ -147,7 +157,8 @@ build ran on driver 570, which supports CUDA 12.8, as the kernels reach the driv
 
 ## Tests
 
-`tests/test_tandem.cpp` runs every check on the default SYCL device, 1994 checks in all. It
+`tests/test_tandem.cpp` runs every check on the default SYCL device: 4410 checks on the CPU
+devices, 5676 on the A100, which also runs the normal fill's shuffle variant. It
 checks every vector of the specification, compares fills with both kernels and in-kernel scalar
 draws against reference stream dumps in `tests/data` (from tandem-cuda), compares fills against
 in-kernel draws at random keys, chunk lengths, positions, lengths and output alignments, checks
@@ -157,51 +168,60 @@ and checks mixed-width draws, random access and derived keys in kernels. In-kern
 draws equal the host's, in-kernel normals agree with them to the tolerance above. Bounded
 fills are checked against Appendix A written out on host generators, against the sequential
 `urand(range)` calls, and against tandem-cuda's fixtures `tests/cross_fill_below.h` at
-positions 0, 1 and 12345 bits, with rejected draws. A bounded fill cut at an element boundary must equal the whole fill at unaligned
-nonzero starts with ranges that reject a quarter of the draws. Normal fills are checked against the
-scalar `normal2()` calls from random positions and counts, odd and even, and against
-`tests/cross_fill_normal.h` from tandem-cuda (16 ulps plus 1e-6 for float, 1e-12 relative for
-double). Signed, Float16, `sycl::half` and complex fills, buffers of rank 1 and 2, and the
-position after empty fills at odd positions are checked too.
+positions 0, 1 and 12345 bits, with rejected draws. A bounded fill cut at an element boundary
+must equal the whole fill at unaligned nonzero starts with ranges that reject a quarter of the
+draws. Normal fills of every kernel variant are checked against the scalar `normal2()` calls,
+bit for bit for double and to 16 ulps plus 1e-6 for float, from random positions and counts
+and from starts at every word offset within a block and several lanes, with K from 1 to 64,
+and against `tests/cross_fill_normal.h` from tandem-cuda (bit for bit for double). Signed,
+Float16, `sycl::half` and complex fills, buffers of rank 1 and 2, and the position after empty
+fills at odd positions are checked too.
 
 `tests/vectors.hpp` is generated from the spec repository's `vectors.json` by
 `tools/gen_vectors.py`. CI runs the tests on the CPU device with AdaptiveCpp on Linux and macOS
 and with DPC++ on Linux, all with `-Wall -Wextra -Werror`, and fails when the vector header or
-the data files differ from upstream or the submodule pin leaves tandem-cuda's main. The suite also passes on an NVIDIA A100 with the `cuda` environment.
+the data files differ from upstream or the submodule pin leaves tandem-cuda's main. The suite
+also passes on an NVIDIA A100 with the `cuda` environment.
 
 ## Speed
 
 NVIDIA A100 40 GB (PCIe), driver 570, AdaptiveCpp 25.10.0 for CUDA 12.9 (`pixi run -e cuda
 bench-cuda`): 2^28 elements into USM device memory, the minimum of 15 runs of eight
-back-to-back fills after a half-second warm-up. The GPU was idle before and after the run. The
-normal rows varied by up to 6% between runs. The tandem-cuda column is its README's figure on
-the same card. Narrow types write fewer bytes for the same element count.
+back-to-back fills after a half-second warm-up. The GPU had no other process for 30 seconds
+before the run and none during it. The tandem-cuda column is its README's figure on the same
+card. Narrow types write fewer bytes for the same element count.
 
 | GiB/s written | tandem-sycl | tandem-cuda |
 |---|---|---|
-| `fill` `uint32_t`, tile kernel (default on GPUs for K >= 8) | 1377 | 1386 |
-| `fill` `uint64_t`, tile kernel | 1389 | 1394 |
+| `fill` `uint32_t`, tile kernel (default on GPUs for K >= 8) | 1371 | 1386 |
+| `fill` `uint64_t`, tile kernel | 1390 | 1394 |
 | `fill` `float`, tile kernel | 1379 | 1381 |
-| `fill` `double`, tile kernel | 1390 | 1392 |
-| `fill` `uint32_t`, chunk kernel | 1314 | 1308 |
+| `fill` `double`, tile kernel | 1389 | 1392 |
+| `fill` `uint32_t`, chunk kernel | 1318 | 1308 |
 | `fill` `uint64_t`, chunk kernel | 1314 | 1315 |
-| `fill` `float`, chunk kernel | 1309 | 1312 |
-| `fill` `double`, chunk kernel | 1316 | 1323 |
-| `fill` `uint16_t` | 1360 | 1370 |
-| `fill` `sycl::half` (tandem-cuda: `fill_f16_bits`) | 1361 | 1364 |
-| `fill` `uint8_t` | 1256 | 1330 |
-| `fill` `bool` (one byte per bit) | 1244 | 1212 |
+| `fill` `float`, chunk kernel | 1312 | 1312 |
+| `fill` `double`, chunk kernel | 1314 | 1323 |
+| `fill` `uint16_t` | 1362 | 1370 |
+| `fill` `sycl::half` (tandem-cuda: `fill_f16_bits`) | 1370 | 1364 |
+| `fill` `uint8_t` | 1263 | 1330 |
+| `fill` `bool` (one byte per bit) | 1250 | 1212 |
 | `fill` `std::complex<double>` | 1395 | |
-| `fill_below` `uint32_t`, range 1000 | 1376 | 1336 |
-| `fill_below` `uint64_t`, range 1000 | 1391 | 1348 |
-| `fill_below` `uint32_t`, range 1000, chunk kernel | 1341 | |
-| `fill_normal` `float` | 952 | 1290 |
-| `fill_normal` `double` | 641 | 750 |
-| `fill_normal` `double`, start at an odd Float64 draw | 328 | 595 |
+| `fill_below` `uint32_t`, range 1000 | 1378 | 1336 |
+| `fill_below` `uint64_t`, range 1000 | 1392 | 1348 |
+| `fill_below` `uint32_t`, range 1000, chunk kernel | 1339 | |
+| `fill_normal` `float` | 1314 | 1290 |
+| `fill_normal` `float`, start at an odd Float32 draw | 1330 | |
+| `fill_normal` `float`, start at word 4 (first block at lane 1) | 1330 | |
+| `fill_normal` `double` | 839 | 833 |
+| `fill_normal` `double`, start at an odd Float64 draw | 771 | 679 |
+| `fill_normal` `double`, start at word 6 | 782 | |
 
 The uniform and bounded fills run at the card's memory bandwidth, as in tandem-cuda. The
-normal fills are slower: they have no tile kernel, and an odd start makes each work item step
-the chunk before its own as well.
+normal fills reach the card's 250 W power cap, so they slow down as the card warms: a second
+run right after this one gave 1297 for the float normal fill, 1133 for its odd start and 821
+for the double one. Alternating the rows on a warm
+card, the starts that shift the pairs within the blocks cost 8 % to 9 % against a start at a
+multiple of 32 words.
 
 ## AI assistance
 

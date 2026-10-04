@@ -1,7 +1,7 @@
 // Fill throughput on the default SYCL device, GiB/s written. Each row runs eight back-to-back
 // fills on an in-order queue and one wait, after a half-second warm-up, and keeps the minimum
-// time of 15 runs. Every fill starts at position 0. An argument keeps the rows whose label
-// contains it.
+// time of 15 runs. Every fill starts at position 0 unless its label says otherwise. An argument
+// keeps the rows whose label contains it.
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -90,17 +90,20 @@ int main(int argc, char **argv) {
             q, tandem::detail::UsmOut<uint32_t>{static_cast<uint32_t *>(buf)}, n, r,
             Kernel::Chunk, {}, 1000u);
     });
-    row("fill_normal float", 4, [&](size_t n) {
-        tandem::Rng r = rng;
-        tandem::fill_normal(q, static_cast<float *>(buf), n, r);
-    });
-    row("fill_normal double", 8, [&](size_t n) {
-        tandem::Rng r = rng;
-        tandem::fill_normal(q, static_cast<double *>(buf), n, r);
-    });
-    row("fill_normal double, odd start", 8, [&](size_t n) {
-        tandem::Rng r = tandem::Rng::from_key(rng.key(), 64, 32);
-        tandem::fill_normal(q, static_cast<double *>(buf), n, r);
-    });
+    /* Normal fills from stream word w: an odd w for float or an odd Float64 draw for double
+     * shifts the pairs within the blocks, and w = 4 or 6 puts the first block at lane 1. */
+    auto normal_row = [&](const char *label, auto tag, uint64_t w) {
+        using E = decltype(tag);
+        row(label, sizeof(E), [&](size_t n) {
+            tandem::Rng r = tandem::Rng::from_key(rng.key(), 32 * w, 32);
+            tandem::fill_normal(q, static_cast<E *>(buf), n, r);
+        });
+    };
+    normal_row("fill_normal float", float{}, 0);
+    normal_row("fill_normal float, odd start", float{}, 1);
+    normal_row("fill_normal float, start at word 4", float{}, 4);
+    normal_row("fill_normal double", double{}, 0);
+    normal_row("fill_normal double, odd start", double{}, 2);
+    normal_row("fill_normal double, start at word 6", double{}, 6);
     sycl::free(buf, q);
 }
