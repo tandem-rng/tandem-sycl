@@ -30,6 +30,9 @@ AdaptiveCpp 25.10.0 (OpenMP CPU backend, and CUDA on an NVIDIA A100) and Intel o
   elements `2j` and `2j + 1` with the cos half first, comes from the draws `2j` and `2j + 1` of
   the Float32 (Float64) fill. An odd count drops the last sin half and still consumes both
   draws, 64 (128) bits per pair.
+- `tandem::fill_exponential(queue, ptr, n, rng)`: standard exponentials `-log(1 - u)` in
+  `float` or `double`, the sequence of `Rng::exponentialf` or `Rng::exponential` calls. Element
+  `i` comes from draw `i` of the Float32 (Float64) fill.
 - `tandem::Rng`: a value type for draws inside kernels. It holds the transport form (128-bit
   key, 64-bit bit position, chunk length `K`) and one cached chunk state, 80 bytes, and a kernel
   captures it by value. Each work item takes its own generator with `rng.split(i)` or by
@@ -41,9 +44,9 @@ AdaptiveCpp 25.10.0 (OpenMP CPU backend, and CUDA on an NVIDIA A100) and Intel o
 Every fill returns a `sycl::event` and does not wait. The USM forms take an optional
 `std::vector<sycl::event>` of dependencies as their last argument. The buffer forms take the
 buffer's dependencies from the SYCL runtime. Positions move as in tandem-cuda: an empty
-`fill` aligns the position to the type's width, and an empty `fill_below` or `fill_normal`
-consumes no draws and leaves the position alone. A fill that would run past stream position
-2^64 throws `std::overflow_error` before it moves the position.
+`fill` aligns the position to the type's width, and an empty `fill_below`, `fill_normal` or
+`fill_exponential` consumes no draws and leaves the position alone. A fill that would run past
+stream position 2^64 throws `std::overflow_error` before it moves the position.
 
 ## Use
 
@@ -63,9 +66,11 @@ uint32_t *die = sycl::malloc_device<uint32_t>(n, q);
 float *g = sycl::malloc_device<float>(n, q);
 auto e1 = tandem::fill_below(q, die, n, rng, 6u);   // uniform on [0, 6)
 auto e2 = tandem::fill_normal(q, g, n, rng);        // standard normals
+double *t = sycl::malloc_device<double>(n, q);
+auto e3 = tandem::fill_exponential(q, t, n, rng);   // standard exponentials
 
 float *y = sycl::malloc_device<float>(m, q);
-q.parallel_for(sycl::range<1>(m), {e1, e2}, [=](sycl::id<1> i) {
+q.parallel_for(sycl::range<1>(m), {e1, e2, e3}, [=](sycl::id<1> i) {
     tandem::Rng r = rng.split(i);           // one generator per work item, from the key alone
     y[i] = r.frand() + r.frand();
 }).wait();
@@ -80,23 +85,26 @@ q.parallel_for(sycl::range<1>(m), {e1, e2}, [=](sycl::id<1> i) {
 | `urand(range)`, `urand64(range)`, `rand(start, end)`, `rand64(start, end)`, `frand(range)`, `drand(start, end)`, ... | bounded draws, uniform by Lemire's multiply and reject |
 | `normal()`, `normalf()`, `normal(mean, sd)` | the cos half of a Box-Muller step from two Float64 or Float32 draws |
 | `normal2()`, `normalf2()` | both halves of the step as a pair `z0`, `z1` |
+| `exponential()`, `exponentialf()` | `-log(1 - u)` of one Float64 or Float32 draw |
 | `split(i)`, `sub(purpose)`, `fork(children, n)` | child generators as the specification defines them |
 | `key()`, `position()`, `set_position(p)`, `chunk_length()` | transport form |
 
 Signed integers hold the two's complement of the unsigned draw of the same width. A complex
 value takes two draws, the real and then the imaginary component.
 
-Bounded and normal draws follow Appendix A of the specification, the contract in `core.hpp`,
-and the same fills in tandem-c, tandem-cuda and tandem-kokkos. `Rng::normal` and its siblings
-take the polynomial Box-Muller of `core.hpp`, the arithmetic of tandem-c's host fills, on the
-host and in kernels. The double normal fill takes the same arithmetic inline, with fused
-multiply-adds and IEEE division and square root, so it equals `Rng::normal2` and tandem-cuda's
-fills bit for bit on every tested device. The float normal fill takes the logarithm of that
-arithmetic and the fast `sycl::native::cos` and `sin`, as tandem-cuda takes `__sincosf`, with
-the angle shifted by half a turn into `[-pi, pi)`. It needs no double precision on the device.
-Float normals agree with the other ports to 16 ulps plus 1e-6. Define
-`TANDEM_PRECISE_F32_NORMAL` for `box_muller2_f32` from `core.hpp` instead. Double fills and
-`Rng::normal` need a device with `aspect::fp64`, `Rng::normalf` does not.
+Bounded, normal and exponential draws follow Appendix A of the specification, the contract in
+`core.hpp`, and the same fills in tandem-c, tandem-cuda and tandem-kokkos. `Rng::normal` and
+its siblings take the polynomial Box-Muller of `core.hpp`, the arithmetic of tandem-c's host
+fills, on the host and in kernels. The double normal fill takes the same arithmetic inline,
+with fused multiply-adds and IEEE division and square root, so it equals `Rng::normal2` and
+tandem-cuda's fills bit for bit on every tested device. The float normal fill takes the
+logarithm of that arithmetic and the fast `sycl::native::cos` and `sin`, as tandem-cuda takes
+`__sincosf`, with the angle shifted by half a turn into `[-pi, pi)`. It needs no double
+precision on the device. Float normals agree with the other ports to 16 ulps plus 1e-6. Define
+`TANDEM_PRECISE_F32_NORMAL` for `box_muller2_f32` from `core.hpp` instead. The exponentials take
+the same polynomial logarithm in both precisions and equal tandem-c's bit for bit on every
+tested device. Double fills, `Rng::normal` and `Rng::exponential` need a device with
+`aspect::fp64`, `Rng::normalf` and `Rng::exponentialf` do not.
 
 ## Kernels
 
@@ -105,7 +113,7 @@ One work item steps one chunk. On GPUs and other accelerators with `K >= 8` a wo
 contiguous bytes per 32 items. On CPU devices, and for smaller `K`, each item stores its blocks
 directly. Both store whole 16-byte blocks when the output's blocks are 16-byte aligned, which a
 kernel checks on the device, so USM and buffer outputs share one path. A bool block is 128
-bytes and leaves as eight 16-byte stores.
+bytes and leaves as eight 16-byte stores. The exponential fills take the same kernels.
 
 On GPUs the normal fill cuts the stream into units of four 32-bit words from the fill's first
 word, two float pairs or one double pair, each one 16-byte store. Each work item steps only
@@ -157,8 +165,8 @@ build ran on driver 570, which supports CUDA 12.8, as the kernels reach the driv
 
 ## Tests
 
-`tests/test_tandem.cpp` runs every check on the default SYCL device: 4410 checks on the CPU
-devices, 5676 on the A100, which also runs the normal fill's shuffle variant. It
+`tests/test_tandem.cpp` runs every check on the default SYCL device: 4520 checks on the CPU
+devices, 5786 on the A100, which also runs the normal fill's shuffle variant. It
 checks every vector of the specification, compares fills with both kernels and in-kernel scalar
 draws against reference stream dumps in `tests/data` (from tandem-cuda), compares fills against
 in-kernel draws at random keys, chunk lengths, positions, lengths and output alignments, checks
@@ -173,9 +181,14 @@ must equal the whole fill at unaligned nonzero starts with ranges that reject a 
 draws. Normal fills of every kernel variant are checked against the scalar `normal2()` calls,
 bit for bit for double and to 16 ulps plus 1e-6 for float, from random positions and counts
 and from starts at every word offset within a block and several lanes, with K from 1 to 64,
-and against `tests/cross_fill_normal.h` from tandem-cuda (bit for bit for double). Signed,
-Float16, `sycl::half` and complex fills, buffers of rank 1 and 2, and the position after empty
-fills at odd positions are checked too.
+and against `tests/cross_fill_normal.h` from tandem-cuda (bit for bit for double). Exponential
+fills of both kernels must equal the scalar `exponential()` calls and tandem-cuda's
+`tests/cross_fill_exponential.h` bit for bit, a cut fill must equal the whole, the FNV-1a hash
+of 10^6 double and 10^6 float exponentials from five starts must equal tandem-c's, and 10^7
+samples must match the Exp(1) law in their first four moments and a Kolmogorov-Smirnov test.
+In-kernel exponentials equal the host's bit for bit. Signed, Float16, `sycl::half` and complex
+fills, buffers of rank 1 and 2, and the position after empty fills at odd positions are checked
+too.
 
 `tests/vectors.hpp` is generated from the spec repository's `vectors.json` by
 `tools/gen_vectors.py`. CI runs the tests on the CPU device with AdaptiveCpp on Linux and macOS
@@ -215,11 +228,13 @@ card. Narrow types write fewer bytes for the same element count.
 | `fill_normal` `double` | 839 | 833 |
 | `fill_normal` `double`, start at an odd Float64 draw | 771 | 679 |
 | `fill_normal` `double`, start at word 6 | 782 | |
+| `fill_exponential` `float` | 1099 | 1022 |
+| `fill_exponential` `double` | 895 | 948 |
 
 The uniform and bounded fills run at the card's memory bandwidth, as in tandem-cuda. The
-normal fills reach the card's 250 W power cap, so they slow down as the card warms: a second
-run right after this one gave 1297 for the float normal fill, 1133 for its odd start and 821
-for the double one. Alternating the rows on a warm
+normal and exponential fills reach the card's 250 W power cap, so they slow down as the card
+warms: a second run right after this one gave 1297 for the float normal fill, 1133 for its odd
+start, 821 for the double one and 975 for the float exponentials. Alternating the rows on a warm
 card, the starts that shift the pairs within the blocks cost 8 % to 9 % against a start at a
 multiple of 32 words.
 

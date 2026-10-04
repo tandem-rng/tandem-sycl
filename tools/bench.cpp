@@ -105,5 +105,13 @@ int main(int argc, char **argv) {
     normal_row("fill_normal double", double{}, 0);
     normal_row("fill_normal double, odd start", double{}, 2);
     normal_row("fill_normal double, start at word 6", double{}, 6);
+    row("fill_exponential float", 4, [&](size_t n) {
+        tandem::Rng r = rng;
+        tandem::fill_exponential(q, static_cast<float *>(buf), n, r);
+    });
+    row("fill_exponential double", 8, [&](size_t n) {
+        tandem::Rng r = rng;
+        tandem::fill_exponential(q, static_cast<double *>(buf), n, r);
+    });
     sycl::free(buf, q);
 }

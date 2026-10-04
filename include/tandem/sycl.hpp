@@ -29,6 +29,8 @@ namespace detail {
 struct f16_bits {}; /* binary16 bit patterns of the Float16 draws, stored as uint16_t */
 struct below32 {};  /* Lemire bounded draws over the u32 fill, see PURPOSE_BELOW32 */
 struct below64 {};
+struct exp32 {}; /* -log(1 - u) of the f32 draws, spec Appendix A */
+struct exp64 {};
 
 /* The fill's geometry: stream bits [p0, p1), rows r0 .. r1 inclusive, groups g0 .. g1, and
  * what the bounded kinds need: the fill's key and chunk length, the range and its rejection
@@ -93,6 +95,18 @@ template <> struct elem<double> {
     static constexpr unsigned bits = 64;
     static double make(const uint32_t w[4], unsigned k) {
         return to_f64(w[2 * k] | ((uint64_t)w[2 * k + 1] << 32));
+    }
+};
+template <> struct elem<exp32> {
+    using out_t = float;
+    static constexpr unsigned bits = 32;
+    static float make(const uint32_t w[4], unsigned k) { return exponential_f32(to_f32(w[k])); }
+};
+template <> struct elem<exp64> {
+    using out_t = double;
+    static constexpr unsigned bits = 64;
+    static double make(const uint32_t w[4], unsigned k) {
+        return exponential_f64(elem<double>::make(w, k));
     }
 };
 template <> struct elem<below32> {
@@ -886,6 +900,35 @@ sycl::event fill_normal(sycl::queue &q, sycl::buffer<E, D> &buf, Rng &rng) {
     static_assert(std::is_same_v<E, float> || std::is_same_v<E, double>,
                   "tandem::fill_normal: the value type must be float or double");
     return detail::fill_normal_kind<E>(q, detail::BufOut<E, E, D>{buf}, buf.size(), rng, {});
+}
+
+namespace detail {
+template <class E> struct exponential {
+    static_assert(std::is_same_v<E, float> || std::is_same_v<E, double>,
+                  "tandem::fill_exponential: the value type must be float or double");
+    using kind = std::conditional_t<std::is_same_v<E, float>, exp32, exp64>;
+};
+} // namespace detail
+
+/* Standard exponentials -log(1 - u) in float or double, the sequence of Rng::exponentialf or
+ * Rng::exponential calls: element i is made from draw i of the f32 or f64 fill. The logarithm is
+ * the host normals' polynomial with explicit fused multiply-adds and IEEE division, so the values
+ * equal tandem-c's bit for bit. An empty fill leaves the position alone. Appendix A of the
+ * specification. */
+template <class E>
+sycl::event fill_exponential(sycl::queue &q, E *out, size_t n, Rng &rng,
+                             const std::vector<sycl::event> &deps = {}) {
+    if (n == 0) /* no draws, so no alignment either */
+        return sycl::event();
+    return detail::fill_kind<typename detail::exponential<E>::kind>(
+        q, detail::UsmOut<E>{out}, n, rng, detail::Kernel::Auto, deps);
+}
+template <class E, int D>
+sycl::event fill_exponential(sycl::queue &q, sycl::buffer<E, D> &buf, Rng &rng) {
+    if (buf.size() == 0)
+        return sycl::event();
+    return detail::fill_kind<typename detail::exponential<E>::kind>(
+        q, detail::BufOut<E, E, D>{buf}, buf.size(), rng, detail::Kernel::Auto, {});
 }
 
 } // namespace tandem

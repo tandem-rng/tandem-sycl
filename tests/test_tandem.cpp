@@ -1,6 +1,7 @@
 // Spec vectors, reference stream dumps, fills against in-kernel draws and the u32 stream, split
-// fills, derived keys, bounded and normal fills against the tandem-cuda fixtures, buffers, and
-// position advancement, on the default SYCL device.
+// fills, derived keys, bounded, normal and exponential fills against the tandem-cuda fixtures,
+// buffers, and position advancement, on the default SYCL device.
+#include <algorithm>
 #include <cmath>
 #include <complex>
 #include <cstdio>
@@ -13,6 +14,7 @@
 #include <tandem/sycl.hpp>
 
 #include "../external/tandem-cuda/tests/cross_fill_below.h"
+#include "../external/tandem-cuda/tests/cross_fill_exponential.h"
 #include "../external/tandem-cuda/tests/cross_fill_normal.h"
 #include "vectors.hpp"
 
@@ -465,8 +467,9 @@ static void test_mixed_draws(sycl::queue &q) {
     CHECK(ha[2] == words[1001] && ha[3] == bits_at(words, 0, 64 + 6400, 64));
 }
 
-// The bounded draws, normals and narrow draws of a generator in a kernel equal the host
-// generator's: integers bit for bit, normals to the tolerance of Appendix A.
+// The bounded draws, normals, exponentials and narrow draws of a generator in a kernel equal
+// the host generator's: integers and exponentials bit for bit, normals to the tolerance of
+// Appendix A.
 template <class E> static bool near_normal(E got, E want) {
     if constexpr (std::is_same_v<E, double>)
         return std::abs(got - want) <= 1e-12 * std::abs(want) + 1e-15;
@@ -482,8 +485,8 @@ static void test_device_draws(sycl::queue &q) {
         uint64_t below64[n];
         int32_t signed32[n];
         int64_t signed64[n];
-        double normal[n], pair[2 * n];
-        float normalf[n], pairf[2 * n];
+        double normal[n], pair[2 * n], expo[n];
+        float normalf[n], pairf[2 * n], expof[n];
         uint64_t pos;
     };
     for (uint32_t K : {1u, 32u}) {
@@ -501,11 +504,13 @@ static void test_device_draws(sycl::queue &q) {
                  d->pair[2 * i] = p.z0, d->pair[2 * i + 1] = p.z1;
                  auto pf = r.normalf2();
                  d->pairf[2 * i] = pf.z0, d->pairf[2 * i + 1] = pf.z1;
+                 d->expo[i] = r.exponential();
+                 d->expof[i] = r.exponentialf();
              }
              d->pos = r.position();
          }).wait();
         Rng r = Rng::from_key(key, 3, K);
-        bool ints = true, normals = true;
+        bool ints = true, normals = true, exps = true;
         for (size_t i = 0; i < n; i++) {
             ints = ints && d->below32[i] == r.urand(i % 2 ? 6u : 0x80000001u);
             ints = ints && d->below64[i] == r.urand64(i % 2 ? 1000003ull : 0x8000000000000001ull);
@@ -519,9 +524,14 @@ static void test_device_draws(sycl::queue &q) {
             auto pf = r.normalf2();
             normals = normals && near_normal(d->pairf[2 * i], pf.z0) &&
                       near_normal(d->pairf[2 * i + 1], pf.z1);
+            double e = r.exponential();
+            float ef = r.exponentialf();
+            exps = exps && std::memcmp(&d->expo[i], &e, 8) == 0 &&
+                   std::memcmp(&d->expof[i], &ef, 4) == 0;
         }
         CHECK(ints);
         CHECK(normals);
+        CHECK(exps);
         CHECK(d->pos == r.position());
         sycl::free(d, q);
     }
@@ -579,34 +589,40 @@ static void test_buffers(sycl::queue &q) {
     Dev<uint32_t> db(q, n);
     Dev<float> dn(q, n);
     Dev<uint16_t> df(q, n / 2);
+    Dev<double> de(q, n);
     tandem::fill(q, d.p, n, u).wait();
     tandem::fill(q, d8.p, n, u).wait();
     tandem::fill_below(q, db.p, n, u, 1000u).wait();
     tandem::fill_normal(q, dn.p, n, u).wait();
     tandem::fill_f16_bits(q, df.p, n / 2, u).wait();
+    tandem::fill_exponential(q, de.p, n, u).wait();
 
     std::vector<double> h(n);
     std::vector<uint8_t> h8(n);
     std::vector<uint32_t> hb(n);
     std::vector<float> hn(n);
     std::vector<uint16_t> hf(n / 2);
+    std::vector<double> he(n);
     {
         sycl::buffer<double, 2> b2(h.data(), sycl::range<2>(a, b));
         sycl::buffer<uint8_t, 1> b8(h8.data(), sycl::range<1>(n));
         sycl::buffer<uint32_t, 1> bb(hb.data(), sycl::range<1>(n));
         sycl::buffer<float, 2> bn(hn.data(), sycl::range<2>(a, b));
         sycl::buffer<uint16_t, 1> bf(hf.data(), sycl::range<1>(n / 2));
+        sycl::buffer<double, 2> be(he.data(), sycl::range<2>(a, b));
         tandem::fill(q, b2, g);
         tandem::fill(q, b8, g);
         tandem::fill_below(q, bb, g, 1000u);
         tandem::fill_normal(q, bn, g);
         tandem::fill_f16_bits(q, bf, g);
+        tandem::fill_exponential(q, be, g);
     }
     CHECK(first_diff(h, d.host(n)) == SIZE_MAX);
     CHECK(first_diff(h8, d8.host(n)) == SIZE_MAX);
     CHECK(first_diff(hb, db.host(n)) == SIZE_MAX);
     CHECK(first_diff(hn, dn.host(n)) == SIZE_MAX);
     CHECK(first_diff(hf, df.host(n / 2)) == SIZE_MAX);
+    CHECK(first_diff(he, de.host(n)) == SIZE_MAX);
     CHECK(g.position() == u.position());
 }
 
@@ -872,8 +888,144 @@ static void test_normal(sycl::queue &q) {
     }
 }
 
+// ---- Exponential fills ---------------------------------------------------------------------
+
+template <class E>
+static std::vector<E> device_exponential(sycl::queue &q, const Key &key, uint64_t pos, uint32_t K,
+                                         size_t n, Kernel kernel, size_t shift, uint64_t *end) {
+    Dev<E> d(q, n + 4);
+    Rng r = Rng::from_key(key, pos, K);
+    tandem::detail::fill_kind<typename tandem::detail::exponential<E>::kind>(
+        q, tandem::detail::UsmOut<E>{d.p + shift}, n, r, kernel, {})
+        .wait();
+    *end = r.position();
+    return d.host(n, shift);
+}
+
+template <class E> static E host_exponential(Rng &r) {
+    if constexpr (std::is_same_v<E, double>)
+        return r.exponential();
+    else
+        return r.exponentialf();
+}
+
+// Both kernels equal the host's exponential() calls bit for bit at random keys, chunk lengths,
+// positions, lengths and alignments, and a fill cut at an element boundary equals the whole.
+template <class E> static void check_exponential(sycl::queue &q, const char *label) {
+    for (const Trial &t : trials(271, 12)) {
+        Rng r = Rng::from_key(t.key, t.pos, t.K);
+        std::vector<E> want(t.n);
+        for (E &x : want)
+            x = host_exponential<E>(r);
+        for (Kernel kernel : KERNELS) {
+            uint64_t end;
+            auto got = device_exponential<E>(q, t.key, t.pos, t.K, t.n, kernel, t.shift, &end);
+            bool same = std::memcmp(got.data(), want.data(), t.n * sizeof(E)) == 0;
+            CHECK(same && end == r.position());
+            if (!same)
+                std::printf("  %s %s exponential (K=%u pos=%llu n=%zu shift=%zu)\n", label,
+                            name(kernel), t.K, (unsigned long long)t.pos, t.n, t.shift);
+        }
+    }
+    const Key key = Rng(5, 6).key();
+    for (uint64_t start : {1ull, 12345ull})
+        for (size_t cut : {1, 7, 299})
+            for (Kernel kernel : KERNELS) {
+                uint64_t end_whole, end_a, end_b;
+                auto whole = device_exponential<E>(q, key, start, 32, 300, kernel, 0, &end_whole);
+                auto a = device_exponential<E>(q, key, start, 32, cut, kernel, 0, &end_a);
+                auto b = device_exponential<E>(q, key, end_a, 32, 300 - cut, kernel, 0, &end_b);
+                a.insert(a.end(), b.begin(), b.end());
+                CHECK(std::memcmp(whole.data(), a.data(), 300 * sizeof(E)) == 0 &&
+                      end_whole == end_b);
+            }
+}
+
+// Moments to the fourth order and a Kolmogorov-Smirnov statistic of the Exp(1) law on 10^7
+// samples. The statistic is taken at the edges of 2^16 equal bins of the CDF, which never
+// exceeds the supremum, so the usual critical value is conservative.
+template <class E> static void check_exp1(sycl::queue &q, const char *label) {
+    constexpr size_t n = 10000000, bins = 1 << 16;
+    Dev<E> d(q, n);
+    Rng r(1);
+    tandem::fill_exponential(q, d.p, n, r).wait();
+    std::vector<uint32_t> hist(bins);
+    double sums[4] = {0, 0, 0, 0};
+    for (E e : d.host(n)) {
+        double x = e, cdf = -std::expm1(-x);
+        hist[std::min((size_t)(cdf * bins), bins - 1)]++;
+        for (double k = 0, p = x; k < 4; k++, p *= x)
+            sums[(int)k] += p;
+    }
+    // E X^k = k!, and the variance of X^k is (2k)! - (k!)^2.
+    const double fact[4] = {1, 2, 6, 24}, var[4] = {1, 20, 684, 39744};
+    for (int k = 0; k < 4; k++) {
+        double m = sums[k] / n;
+        CHECK(std::abs(m - fact[k]) < 5 * std::sqrt(var[k] / n));
+        if (std::abs(m - fact[k]) >= 5 * std::sqrt(var[k] / n))
+            std::printf("  %s exponential moment %d: %g\n", label, k + 1, m);
+    }
+    double cum = 0, dmax = 0;
+    for (size_t i = 0; i < bins; i++) {
+        cum += hist[i];
+        dmax = std::max(dmax, std::abs(cum / n - (double)(i + 1) / bins));
+    }
+    // P(sqrt(n) D > 1.95) is 0.001.
+    CHECK(dmax * std::sqrt((double)n) < 1.95);
+}
+
+static uint64_t fnv1a(uint64_t h, const void *p, size_t n) {
+    const unsigned char *b = static_cast<const unsigned char *>(p);
+    for (size_t i = 0; i < n; i++)
+        h = (h ^ b[i]) * 0x100000001b3ull;
+    return h;
+}
+
+// The fixtures of tandem-cuda and the hash of tandem-c's tests/test_exponential_bits.c: 10^6
+// f64 then 10^6 f32 exponentials from each start, bit for bit.
+static void test_exponential(sycl::queue &q) {
+    check_exponential<double>(q, "f64");
+    check_exponential<float>(q, "f32");
+    check_exp1<double>(q, "f64");
+    check_exp1<float>(q, "f32");
+
+    const Key k42 = Rng(42).key();
+    for (Kernel kernel : KERNELS) {
+        for (const auto &f : CROSS_EXP64) {
+            uint64_t end;
+            auto v = device_exponential<double>(q, k42, f.pos, 32, f.n, kernel, 0, &end);
+            CHECK(std::memcmp(v.data(), f.out, f.n * sizeof(double)) == 0 &&
+                  end == tandem::align_pos(f.pos, 64) + 64 * f.n);
+        }
+        for (const auto &f : CROSS_EXP32) {
+            uint64_t end;
+            auto v = device_exponential<float>(q, k42, f.pos, 32, f.n, kernel, 0, &end);
+            CHECK(std::memcmp(v.data(), f.out, f.n * sizeof(float)) == 0 &&
+                  end == tandem::align_pos(f.pos, 32) + 32 * f.n);
+        }
+    }
+
+    constexpr size_t n = 1000000;
+    Dev<double> d(q, n);
+    Dev<float> f(q, n);
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint64_t start : {0ull, 1ull, 77ull, 12345ull, 1ull << 30}) {
+        Rng r(2026, 7);
+        r.set_position(start);
+        tandem::fill_exponential(q, d.p, n, r);
+        tandem::fill_exponential(q, f.p, n, r).wait();
+        auto vd = d.host(n);
+        auto vf = f.host(n);
+        h = fnv1a(fnv1a(h, vd.data(), n * sizeof(double)), vf.data(), n * sizeof(float));
+    }
+    CHECK(h == 0x47f8f98297d94ee2ull);
+    if (h != 0x47f8f98297d94ee2ull)
+        std::printf("  exponential hash %016llx\n", (unsigned long long)h);
+}
+
 // Positions after a fill follow tandem-cuda: an empty fill of a type aligns the position to its
-// width, and an empty bounded or normal fill consumes no draws and leaves it alone.
+// width, and an empty bounded, normal or exponential fill consumes no draws and leaves it
+// alone.
 static void test_positions(sycl::queue &q) {
     const Key key = Rng(3).key();
     Dev<uint64_t> d(q, 4);
@@ -890,6 +1042,8 @@ static void test_positions(sycl::queue &q) {
         r.set_position(pos);
         tandem::fill_normal(q, reinterpret_cast<double *>(d.p), 0, r).wait();
         tandem::fill_normal(q, reinterpret_cast<float *>(d.p), 0, r).wait();
+        tandem::fill_exponential(q, reinterpret_cast<double *>(d.p), 0, r).wait();
+        tandem::fill_exponential(q, reinterpret_cast<float *>(d.p), 0, r).wait();
         tandem::fill_below(q, reinterpret_cast<uint32_t *>(d.p), 0, r, 6u).wait();
         tandem::fill_below(q, d.p, 0, r, 6u).wait();
         CHECK(r.position() == pos);
@@ -942,6 +1096,7 @@ int main(int argc, char **argv) {
     test_buffers(q);
     test_below(q);
     test_normal(q);
+    test_exponential(q);
     test_positions(q);
     if (failures) {
         std::printf("%ld of %ld checks failed\n", failures, checks);
