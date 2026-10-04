@@ -1,5 +1,13 @@
 # Tests
 
+```sh
+pixi run test                         # AdaptiveCpp 25.10, OpenMP backend on the host CPU
+pixi run -e dpcpp test-dpcpp          # DPC++ 2026.1 with Intel's OpenCL CPU runtime, Linux
+pixi run -e cuda test-cuda            # AdaptiveCpp 25.10 for CUDA 12.9, Linux with an NVIDIA GPU
+```
+
+## Suite
+
 `tests/test_tandem.cpp` runs every check on the default SYCL device: 4520 checks on the CPU
 devices, 5786 on the A100, which also runs the normal fill's shuffle variant. It
 checks every vector of the specification, compares fills with both kernels and in-kernel scalar
@@ -25,8 +33,14 @@ In-kernel exponentials equal the host's bit for bit. Signed, Float16, `sycl::hal
 fills, buffers of rank 1 and 2, and the position after empty fills at odd positions are checked
 too.
 
+## Fixtures
+
 `tests/vectors.hpp` is generated from the spec repository's `vectors.json` by
-`tools/gen_vectors.py`. CI runs the tests on the CPU device with AdaptiveCpp on Linux and macOS
-and with DPC++ on Linux, all with `-Wall -Wextra -Werror`, and fails when the vector header or
-the data files differ from upstream or the submodule pin leaves tandem-cuda's main. The suite
-also passes on an NVIDIA A100 with the `cuda` environment.
+`tools/gen_vectors.py`.
+
+## CI
+
+CI runs the tests on the CPU device with AdaptiveCpp on Linux and macOS and with DPC++ on
+Linux, all with `-Wall -Wextra -Werror`, and fails when the vector header or the data files
+differ from upstream or the submodule pin leaves tandem-cuda's main. The suite also passes on
+an NVIDIA A100 with the `cuda` environment.

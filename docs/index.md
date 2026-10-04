@@ -1,14 +1,18 @@
-# tandem-sycl documentation
+# tandem-sycl
+
+Header-only [SYCL](https://www.khronos.org/sycl/) implementation of Tandem8x32. It produces the
+stream of the [specification](https://github.com/tandem-rng/spec/blob/main/SPEC.md) bit for
+bit, on any SYCL device.
 
 - [API](api.md): the fills, `tandem::Rng` and its draws.
-- [Design](design.md): derived draws and the kernels.
-- [Tests](tests.md): what the suite checks.
+- [Design](design.md): the fill kernels, normals and exponentials.
+- [Tests](tests.md): what the suite checks and what CI runs.
 - [Speed](speed.md): A100 figures against tandem-cuda.
 
-Tested with AdaptiveCpp 25.10.0 (OpenMP CPU backend, and CUDA on an NVIDIA A100) and Intel oneAPI DPC++
-2026.1.1 (OpenCL CPU runtime 2026.1.1).
+## Install
 
-## Build
+Tested with AdaptiveCpp 25.10.0 (OpenMP CPU backend, and CUDA on an NVIDIA A100) and Intel
+oneAPI DPC++ 2026.1.1 (OpenCL CPU runtime 2026.1.1).
 
 Header-only. Clone with the submodule:
 

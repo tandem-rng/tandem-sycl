@@ -1,5 +1,9 @@
 # Speed
 
+`pixi run -e cuda bench-cuda` produces the figures.
+
+## GPU
+
 NVIDIA A100 40 GB (PCIe), driver 570, AdaptiveCpp 25.10.0 for CUDA 12.9 (`pixi run -e cuda
 bench-cuda`): 2^28 elements into USM device memory, the minimum of 15 runs of eight
 back-to-back fills after a half-second warm-up. The GPU had no other process for 30 seconds

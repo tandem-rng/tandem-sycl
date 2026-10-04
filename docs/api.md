@@ -1,5 +1,35 @@
 # API
 
+## Use
+
+```cpp
+#include <tandem/sycl.hpp>
+
+sycl::queue q;
+tandem::Rng rng(42);                        // 128-bit seed as two halves, default K = 32
+double *x = sycl::malloc_device<double>(n, q);
+tandem::fill(q, x, n, rng);                 // the spec's Float64 fill
+double u = rng.drand();                     // continues the stream after the fill
+
+sycl::buffer<std::complex<float>, 2> z(sycl::range<2>(64, 64));
+tandem::fill(q, z, rng);                    // real then imaginary part per value
+
+uint32_t *die = sycl::malloc_device<uint32_t>(n, q);
+float *g = sycl::malloc_device<float>(n, q);
+auto e1 = tandem::fill_below(q, die, n, rng, 6u);   // uniform on [0, 6)
+auto e2 = tandem::fill_normal(q, g, n, rng);        // standard normals
+double *t = sycl::malloc_device<double>(n, q);
+auto e3 = tandem::fill_exponential(q, t, n, rng);   // standard exponentials
+
+float *y = sycl::malloc_device<float>(m, q);
+q.parallel_for(sycl::range<1>(m), {e1, e2, e3}, [=](sycl::id<1> i) {
+    tandem::Rng r = rng.split(i);           // one generator per work item, from the key alone
+    y[i] = r.frand() + r.frand();
+}).wait();
+```
+
+## Reference
+
 - `tandem::fill(queue, ptr, n, rng)` and `tandem::fill(queue, buffer, rng)`: fill USM memory or a
   whole `sycl::buffer` of any rank with the draws that start at the generator's position, as the
   specification's fill defines, and move the position past them. The value type is `bool`, an
@@ -38,34 +68,6 @@ buffer's dependencies from the SYCL runtime. Positions move as in tandem-cuda: a
 `fill` aligns the position to the type's width, and an empty `fill_below`, `fill_normal` or
 `fill_exponential` consumes no draws and leaves the position alone. A fill that would run past
 stream position 2^64 throws `std::overflow_error` before it moves the position.
-
-## Use
-
-```cpp
-#include <tandem/sycl.hpp>
-
-sycl::queue q;
-tandem::Rng rng(42);                        // 128-bit seed as two halves, default K = 32
-double *x = sycl::malloc_device<double>(n, q);
-tandem::fill(q, x, n, rng);                 // the spec's Float64 fill
-double u = rng.drand();                     // continues the stream after the fill
-
-sycl::buffer<std::complex<float>, 2> z(sycl::range<2>(64, 64));
-tandem::fill(q, z, rng);                    // real then imaginary part per value
-
-uint32_t *die = sycl::malloc_device<uint32_t>(n, q);
-float *g = sycl::malloc_device<float>(n, q);
-auto e1 = tandem::fill_below(q, die, n, rng, 6u);   // uniform on [0, 6)
-auto e2 = tandem::fill_normal(q, g, n, rng);        // standard normals
-double *t = sycl::malloc_device<double>(n, q);
-auto e3 = tandem::fill_exponential(q, t, n, rng);   // standard exponentials
-
-float *y = sycl::malloc_device<float>(m, q);
-q.parallel_for(sycl::range<1>(m), {e1, e2, e3}, [=](sycl::id<1> i) {
-    tandem::Rng r = rng.split(i);           // one generator per work item, from the key alone
-    y[i] = r.frand() + r.frand();
-}).wait();
-```
 
 ## Rng draws
 
