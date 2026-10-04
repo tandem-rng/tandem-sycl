@@ -337,12 +337,20 @@ inline Pair2<float> normal_step_f32(float a, float b) {
 #endif
 }
 
+/* The double step. core.hpp's box_muller2 is the host polynomial outside CUDA and HIP, an out
+ * of line call per pair, so a kernel takes the device's log and sincos instead. */
+inline Pair2<double> normal_step_f64(double a, double b) {
+    double r = sycl::sqrt(-2.0 * sycl::log(1.0 - a)), c;
+    double s = sycl::sincos(6.283185307179586 * b, &c);
+    return Pair2<double>{r * c, r * s};
+}
+
 /* The normal pair of the uniforms in the words v: two Float64 draws (four words) or two Float32
  * draws (two words). */
 template <class O> inline Pair2<O> normal_pair(const uint32_t *v) {
     if constexpr (std::is_same_v<O, double>)
-        return box_muller2(to_f64(v[0] | ((uint64_t)v[1] << 32)),
-                           to_f64(v[2] | ((uint64_t)v[3] << 32)));
+        return normal_step_f64(to_f64(v[0] | ((uint64_t)v[1] << 32)),
+                               to_f64(v[2] | ((uint64_t)v[3] << 32)));
     else
         return normal_step_f32(to_f32(v[0]), to_f32(v[1]));
 }
