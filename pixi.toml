@@ -1,0 +1,57 @@
+# Development environments. The default one has AdaptiveCpp 25.10 from conda-forge, whose
+# OpenMP backend runs SYCL kernels on the host CPU. `dpcpp` has Intel's oneAPI DPC++ compiler
+# with the OpenCL CPU runtime. `cuda` has AdaptiveCpp built against CUDA 12.9, which runs the
+# same kernels on NVIDIA GPUs.
+[workspace]
+name = "tandem-sycl"
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "linux-64"]
+
+[dependencies]
+cmake = ">=3.25"
+ninja = "*"
+python = ">=3.11"
+
+[feature.acpp.dependencies]
+adaptivecpp = { version = "25.10.*", build = "cpu_llvm19*" }
+
+# The package records the host compiler of its own build, which does not exist here.
+[feature.acpp.activation.env]
+ACPP_CPU_CXX = "$CONDA_PREFIX/bin/clang++"
+
+[feature.acpp.tasks]
+configure = "cmake -S . -B build/acpp -G Ninja -DCMAKE_BUILD_TYPE=Release -DTANDEM_BENCH=ON"
+build = { cmd = "cmake --build build/acpp", depends-on = ["configure"] }
+test = { cmd = "ctest --test-dir build/acpp --output-on-failure", depends-on = ["build"] }
+
+[feature.dpcpp]
+platforms = ["linux-64"]
+
+[feature.dpcpp.dependencies]
+dpcpp_linux-64 = "2026.1.*"
+intel-opencl-rt = "2026.1.*"
+
+[feature.dpcpp.tasks]
+configure-dpcpp = "cmake -S . -B build/dpcpp -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=icpx -DTANDEM_BENCH=ON"
+build-dpcpp = { cmd = "cmake --build build/dpcpp", depends-on = ["configure-dpcpp"] }
+test-dpcpp = { cmd = "ctest --test-dir build/dpcpp --output-on-failure", depends-on = ["build-dpcpp"] }
+
+[feature.cuda]
+platforms = ["linux-64"]
+
+[feature.cuda.dependencies]
+adaptivecpp = { version = "25.10.*", build = "cuda129_llvm19*" }
+
+[feature.cuda.activation.env]
+ACPP_CPU_CXX = "$CONDA_PREFIX/bin/clang++"
+
+[feature.cuda.tasks]
+configure-cuda = "cmake -S . -B build/cuda -G Ninja -DCMAKE_BUILD_TYPE=Release -DTANDEM_BENCH=ON"
+build-cuda = { cmd = "cmake --build build/cuda", depends-on = ["configure-cuda"] }
+test-cuda = { cmd = "ctest --test-dir build/cuda --output-on-failure", depends-on = ["build-cuda"] }
+bench-cuda = { cmd = "build/cuda/bench", depends-on = ["build-cuda"] }
+
+[environments]
+default = ["acpp"]
+dpcpp = ["dpcpp"]
+cuda = ["cuda"]
