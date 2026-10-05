@@ -468,13 +468,10 @@ static void test_mixed_draws(sycl::queue &q) {
 }
 
 // The bounded draws, normals, exponentials and narrow draws of a generator in a kernel equal
-// the host generator's: integers and exponentials bit for bit, normals to the tolerance of
-// Appendix A.
-template <class E> static bool near_normal(E got, E want) {
-    if constexpr (std::is_same_v<E, double>)
-        return std::abs(got - want) <= 1e-12 * std::abs(want) + 1e-15;
-    else
-        return std::abs(got - want) <= 16 * 0x1p-23f * std::abs(want) + 1e-6f;
+// the host generator's: integers, double normals and exponentials bit for bit, float normals to
+// the tolerance of Appendix A.
+static bool near_normal(float got, float want) {
+    return std::abs(got - want) <= 16 * 0x1p-23f * std::abs(want) + 1e-6f;
 }
 
 static void test_device_draws(sycl::queue &q) {
@@ -516,11 +513,12 @@ static void test_device_draws(sycl::queue &q) {
             ints = ints && d->below64[i] == r.urand64(i % 2 ? 1000003ull : 0x8000000000000001ull);
             ints = ints && d->signed32[i] == r.rand(-5, 5);
             ints = ints && d->signed64[i] == r.rand64(-3, 1000);
-            normals = normals && near_normal(d->normal[i], r.normal());
+            double z = r.normal();
+            normals = normals && std::memcmp(&d->normal[i], &z, 8) == 0;
             normals = normals && near_normal(d->normalf[i], r.normalf());
             auto p = r.normal2();
-            normals = normals && near_normal(d->pair[2 * i], p.z0) &&
-                      near_normal(d->pair[2 * i + 1], p.z1);
+            normals = normals && std::memcmp(&d->pair[2 * i], &p.z0, 8) == 0 &&
+                      std::memcmp(&d->pair[2 * i + 1], &p.z1, 8) == 0;
             auto pf = r.normalf2();
             normals = normals && near_normal(d->pairf[2 * i], pf.z0) &&
                       near_normal(d->pairf[2 * i + 1], pf.z1);
@@ -588,12 +586,14 @@ static void test_buffers(sycl::queue &q) {
     Dev<uint8_t> d8(q, n);
     Dev<uint32_t> db(q, n);
     Dev<float> dn(q, n);
+    Dev<double> dz(q, n);
     Dev<uint16_t> df(q, n / 2);
     Dev<double> de(q, n);
     tandem::fill(q, d.p, n, u).wait();
     tandem::fill(q, d8.p, n, u).wait();
     tandem::fill_below(q, db.p, n, u, 1000u).wait();
     tandem::fill_normal(q, dn.p, n, u).wait();
+    tandem::fill_normal(q, dz.p, n, u).wait();
     tandem::fill_f16_bits(q, df.p, n / 2, u).wait();
     tandem::fill_exponential(q, de.p, n, u).wait();
 
@@ -601,6 +601,7 @@ static void test_buffers(sycl::queue &q) {
     std::vector<uint8_t> h8(n);
     std::vector<uint32_t> hb(n);
     std::vector<float> hn(n);
+    std::vector<double> hz(n);
     std::vector<uint16_t> hf(n / 2);
     std::vector<double> he(n);
     {
@@ -608,12 +609,14 @@ static void test_buffers(sycl::queue &q) {
         sycl::buffer<uint8_t, 1> b8(h8.data(), sycl::range<1>(n));
         sycl::buffer<uint32_t, 1> bb(hb.data(), sycl::range<1>(n));
         sycl::buffer<float, 2> bn(hn.data(), sycl::range<2>(a, b));
+        sycl::buffer<double, 1> bz(hz.data(), sycl::range<1>(n));
         sycl::buffer<uint16_t, 1> bf(hf.data(), sycl::range<1>(n / 2));
         sycl::buffer<double, 2> be(he.data(), sycl::range<2>(a, b));
         tandem::fill(q, b2, g);
         tandem::fill(q, b8, g);
         tandem::fill_below(q, bb, g, 1000u);
         tandem::fill_normal(q, bn, g);
+        tandem::fill_normal(q, bz, g);
         tandem::fill_f16_bits(q, bf, g);
         tandem::fill_exponential(q, be, g);
     }
@@ -621,6 +624,7 @@ static void test_buffers(sycl::queue &q) {
     CHECK(first_diff(h8, d8.host(n)) == SIZE_MAX);
     CHECK(first_diff(hb, db.host(n)) == SIZE_MAX);
     CHECK(first_diff(hn, dn.host(n)) == SIZE_MAX);
+    CHECK(first_diff(hz, dz.host(n)) == SIZE_MAX);
     CHECK(first_diff(hf, df.host(n / 2)) == SIZE_MAX);
     CHECK(first_diff(he, de.host(n)) == SIZE_MAX);
     CHECK(g.position() == u.position());
@@ -777,8 +781,116 @@ static void test_below(sycl::queue &q) {
     }
 }
 
-// The normal fill's kernels: the chunk kernel, and the group kernel passing blocks through
-// local memory and, where sub-groups hold whole groups of eight lanes, by shuffles.
+// ---- Float64 normal fills ------------------------------------------------------------------
+
+static std::vector<double> device_normal64(sycl::queue &q, const Key &key, uint64_t pos,
+                                           uint32_t K, size_t n, Kernel kernel, size_t shift,
+                                           uint64_t *end) {
+    Dev<double> d(q, n + 4);
+    Rng r = Rng::from_key(key, pos, K);
+    tandem::detail::fill_normal_kind<double>(q, tandem::detail::UsmOut<double>{d.p + shift}, n,
+                                             r, {}, kernel)
+        .wait();
+    *end = r.position();
+    return d.host(n, shift);
+}
+
+static bool same_bits(const std::vector<double> &a, const std::vector<double> &b) {
+    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 8) == 0;
+}
+
+// Both kernels equal the host's normal() calls bit for bit, end position included, at random
+// keys, chunk lengths, positions, lengths and alignments. The trials hold misses of the fast
+// path, and the tail beyond R among them.
+static void check_normal64(sycl::queue &q) {
+    size_t misses = 0, tails = 0;
+    for (const Trial &t : trials(1618, 16)) {
+        Rng r = Rng::from_key(t.key, t.pos, t.K), u = r;
+        std::vector<double> want(t.n);
+        for (double &x : want)
+            x = r.normal();
+        for (size_t i = 0; i < t.n; i++) {
+            uint64_t d = u.urand64();
+            bool hit;
+            tandem::normal_f64_fast(d, hit);
+            misses += !hit;
+            tails += !hit && (d & 1023u) == 0;
+        }
+        for (Kernel kernel : KERNELS) {
+            uint64_t end;
+            auto got = device_normal64(q, t.key, t.pos, t.K, t.n, kernel, t.shift, &end);
+            CHECK(same_bits(got, want) && end == r.position());
+            if (!same_bits(got, want))
+                std::printf("  f64 %s normal (K=%u pos=%llu n=%zu shift=%zu)\n", name(kernel),
+                            t.K, (unsigned long long)t.pos, t.n, t.shift);
+        }
+    }
+    CHECK(misses > 0 && tails > 0);
+}
+
+// A fill cut at any element equals the whole fill: at an odd element, at the first missed
+// element and just after it, at a start whose global draw index differs from the element index.
+static void check_normal64_cut(sycl::queue &q) {
+    constexpr size_t n = 3000;
+    const Key key = Rng(5, 6).key();
+    const uint64_t start = 77;
+    Rng u = Rng::from_key(key, start, 32);
+    size_t m = 0;
+    for (bool hit = true; hit; m++)
+        tandem::normal_f64_fast(u.urand64(), hit);
+    m--;
+    for (size_t cut : {(size_t)1, (size_t)1001, m, m + 1})
+        for (Kernel kernel : KERNELS) {
+            uint64_t end_whole, end_a, end_b;
+            auto whole = device_normal64(q, key, start, 32, n, kernel, 0, &end_whole);
+            auto a = device_normal64(q, key, start, 32, cut, kernel, 0, &end_a);
+            auto b = device_normal64(q, key, end_a, 32, n - cut, kernel, 0, &end_b);
+            a.insert(a.end(), b.begin(), b.end());
+            CHECK(same_bits(whole, a) && end_whole == end_b);
+        }
+}
+
+static uint64_t fnv1a(uint64_t h, const void *p, size_t n) {
+    const unsigned char *b = static_cast<const unsigned char *>(p);
+    for (size_t i = 0; i < n; i++)
+        h = (h ^ b[i]) * 0x100000001b3ull;
+    return h;
+}
+
+// The fixtures of tandem-cuda, whose last rows hold misses of every kind, and the hash of
+// tandem-c's tests/test_normal_bits.c: 10^6 normals from each of five starts, bit for bit.
+static void test_normal64(sycl::queue &q) {
+    check_normal64(q);
+    check_normal64_cut(q);
+
+    const Key k42 = Rng(42).key();
+    for (Kernel kernel : KERNELS)
+        for (const auto &f : CROSS_NORMAL64) {
+            uint64_t end;
+            auto v = device_normal64(q, k42, f.pos, 32, f.n, kernel, 0, &end);
+            CHECK(std::memcmp(v.data(), f.out, f.n * sizeof(double)) == 0 &&
+                  end == tandem::align_pos(f.pos, 64) + 64 * f.n);
+        }
+
+    constexpr size_t n = 1000000;
+    Dev<double> d(q, n);
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint64_t start : {0ull, 1ull, 77ull, 12345ull, 1ull << 30}) {
+        Rng r(2026, 7);
+        r.set_position(start);
+        tandem::fill_normal(q, d.p, n, r).wait();
+        auto v = d.host(n);
+        h = fnv1a(h, v.data(), n * sizeof(double));
+    }
+    CHECK(h == 0xa61cfa844c85f7c1ull);
+    if (h != 0xa61cfa844c85f7c1ull)
+        std::printf("  normal f64 hash %016llx\n", (unsigned long long)h);
+}
+
+// ---- Float32 normal fills ------------------------------------------------------------------
+
+// The float normal fill's kernels: the chunk kernel, and the group kernel passing blocks
+// through local memory and, where sub-groups hold whole groups of eight lanes, by shuffles.
 using tandem::detail::Exchange;
 struct NormalKernel {
     Kernel kernel;
@@ -793,30 +905,24 @@ static std::vector<NormalKernel> normal_kernels(sycl::queue &q) {
     return v;
 }
 
-template <class E>
-static std::vector<E> device_normal(sycl::queue &q, const Key &key, uint64_t pos, uint32_t K,
-                                    size_t n, size_t shift, uint64_t *end,
-                                    NormalKernel nk = {Kernel::Auto, Exchange::Auto, "auto"}) {
-    Dev<E> d(q, n + 4);
+static std::vector<float> device_normal(sycl::queue &q, const Key &key, uint64_t pos, uint32_t K,
+                                        size_t n, size_t shift, uint64_t *end,
+                                        NormalKernel nk) {
+    Dev<float> d(q, n + 4);
     Rng r = Rng::from_key(key, pos, K);
-    tandem::detail::fill_normal_kind<E>(q, tandem::detail::UsmOut<E>{d.p + shift}, n, r, {},
-                                        nk.kernel, nk.exchange)
+    tandem::detail::fill_normal_f32_kind(q, tandem::detail::UsmOut<float>{d.p + shift}, n, r, {},
+                                         nk.kernel, nk.exchange)
         .wait();
     *end = r.position();
     return d.host(n, shift);
 }
 
-// The flattened normal2 calls: an odd count drops the last sin half and still consumes both
+// The flattened normalf2 calls: an odd count drops the last sin half and still consumes both
 // draws.
-template <class E> static std::vector<E> sequential_normals(Rng &r, size_t n) {
-    std::vector<E> z(n);
+static std::vector<float> sequential_normals(Rng &r, size_t n) {
+    std::vector<float> z(n);
     for (size_t i = 0; i < n; i += 2) {
-        auto pair = [&] {
-            if constexpr (std::is_same_v<E, double>)
-                return r.normal2();
-            else
-                return r.normalf2();
-        }();
+        auto pair = r.normalf2();
         z[i] = pair.z0;
         if (i + 1 < n)
             z[i + 1] = pair.z1;
@@ -824,13 +930,11 @@ template <class E> static std::vector<E> sequential_normals(Rng &r, size_t n) {
     return z;
 }
 
-template <class E>
-static void check_normal_at(sycl::queue &q, const char *label, const Trial &t,
-                            NormalKernel kernel) {
+static void check_normal_at(sycl::queue &q, const Trial &t, NormalKernel kernel) {
     Rng r = Rng::from_key(t.key, t.pos, t.K);
-    std::vector<E> want = sequential_normals<E>(r, t.n);
+    std::vector<float> want = sequential_normals(r, t.n);
     uint64_t end;
-    auto got = device_normal<E>(q, t.key, t.pos, t.K, t.n, t.shift, &end, kernel);
+    auto got = device_normal(q, t.key, t.pos, t.K, t.n, t.shift, &end, kernel);
     size_t bad = SIZE_MAX;
     for (size_t i = 0; i < t.n && bad == SIZE_MAX; i++)
         if (!near_normal(got[i], want[i]))
@@ -838,54 +942,37 @@ static void check_normal_at(sycl::queue &q, const char *label, const Trial &t,
     CHECK(bad == SIZE_MAX);
     CHECK(end == r.position());
     if (bad != SIZE_MAX)
-        std::printf("  %s %s normal (K=%u pos=%llu n=%zu shift=%zu) at %zu\n", label, kernel.name,
-                    t.K, (unsigned long long)t.pos, t.n, t.shift, bad);
-    /* The double step is the host's arithmetic with explicit fused multiply-adds and IEEE
-     * division and square root, so it matches bit for bit on every tested device. */
-    if constexpr (std::is_same_v<E, double>)
-        CHECK(std::memcmp(got.data(), want.data(), t.n * sizeof(E)) == 0);
+        std::printf("  f32 %s normal (K=%u pos=%llu n=%zu shift=%zu) at %zu\n", kernel.name, t.K,
+                    (unsigned long long)t.pos, t.n, t.shift, bad);
 }
 
 // The group kernel cuts the fill into units of four words from its first word S and writes
 // them in octets aligned to the output, so the starts cover S % 4 (the word in a block) and
 // S / 4 % 8 (the lane of the first block) in several combinations, with group and work group
-// boundaries and every K kind.
-template <class E> static void check_normal(sycl::queue &q, const char *label) {
+// boundaries and every K kind. Fixtures from tandem-cuda at positions that put the first pair
+// at an even and an odd draw, with an odd count.
+static void test_normal32(sycl::queue &q) {
     for (const Trial &t : trials(42, 24))
         for (NormalKernel kernel : normal_kernels(q))
-            check_normal_at<E>(q, label, t, kernel);
+            check_normal_at(q, t, kernel);
     const Key key = Rng(9).key();
     for (uint32_t K : {1u, 2u, 8u, 16u, 64u})
         for (uint64_t pos : {0ull, 32ull, 64ull, 96ull, 128ull, 416ull, 960ull, 8160ull, 8191ull})
             for (size_t n : {(size_t)1, (size_t)2, (size_t)3, (size_t)70001, (size_t)70002})
                 for (NormalKernel kernel : normal_kernels(q))
-                    check_normal_at<E>(q, label, Trial{key, K, pos, n, n % 2 ? 1u : 0u}, kernel);
-}
-
-// Fixtures from tandem-cuda at positions that put the first pair at an even and an odd draw,
-// with an odd count, bit for bit for double.
-static void test_normal(sycl::queue &q) {
-    check_normal<double>(q, "f64");
-    check_normal<float>(q, "f32");
+                    check_normal_at(q, Trial{key, K, pos, n, n % 2 ? 1u : 0u}, kernel);
 
     const Key k42 = Rng(42).key();
-    for (NormalKernel kernel : normal_kernels(q)) {
-        for (const auto &f : CROSS_NORMAL64) {
-            uint64_t end;
-            auto v = device_normal<double>(q, k42, f.pos, 32, f.n, 0, &end, kernel);
-            CHECK(std::memcmp(v.data(), f.out, f.n * sizeof(double)) == 0);
-            CHECK(end == tandem::align_pos(f.pos, 64) + 128 * ((f.n + 1) / 2));
-        }
+    for (NormalKernel kernel : normal_kernels(q))
         for (const auto &f : CROSS_NORMAL32) {
             uint64_t end;
-            auto v = device_normal<float>(q, k42, f.pos, 32, f.n, 0, &end, kernel);
+            auto v = device_normal(q, k42, f.pos, 32, f.n, 0, &end, kernel);
             bool ok = true;
             for (unsigned i = 0; i < f.n; i++)
                 ok = ok && near_normal(v[i], f.out[i]);
             CHECK(ok);
             CHECK(end == tandem::align_pos(f.pos, 32) + 64 * ((f.n + 1) / 2));
         }
-    }
 }
 
 // ---- Exponential fills ---------------------------------------------------------------------
@@ -974,13 +1061,6 @@ template <class E> static void check_exp1(sycl::queue &q, const char *label) {
     CHECK(dmax * std::sqrt((double)n) < 1.95);
 }
 
-static uint64_t fnv1a(uint64_t h, const void *p, size_t n) {
-    const unsigned char *b = static_cast<const unsigned char *>(p);
-    for (size_t i = 0; i < n; i++)
-        h = (h ^ b[i]) * 0x100000001b3ull;
-    return h;
-}
-
 // The fixtures of tandem-cuda and the hash of tandem-c's tests/test_exponential_bits.c: 10^6
 // f64 then 10^6 f32 exponentials from each start, bit for bit.
 static void test_exponential(sycl::queue &q) {
@@ -1023,9 +1103,9 @@ static void test_exponential(sycl::queue &q) {
         std::printf("  exponential hash %016llx\n", (unsigned long long)h);
 }
 
-// Positions after a fill follow tandem-cuda: an empty fill of a type aligns the position to its
-// width, and an empty bounded, normal or exponential fill consumes no draws and leaves it
-// alone.
+// Positions after a fill follow tandem-cuda: an empty fill of a type or of double normals aligns
+// the position to its width, and an empty bounded, float normal or exponential fill consumes no
+// draws and leaves it alone.
 static void test_positions(sycl::queue &q) {
     const Key key = Rng(3).key();
     Dev<uint64_t> d(q, 4);
@@ -1041,6 +1121,8 @@ static void test_positions(sycl::queue &q) {
         CHECK(r.position() == pos);
         r.set_position(pos);
         tandem::fill_normal(q, reinterpret_cast<double *>(d.p), 0, r).wait();
+        CHECK(r.position() == tandem::align_pos(pos, 64));
+        r.set_position(pos);
         tandem::fill_normal(q, reinterpret_cast<float *>(d.p), 0, r).wait();
         tandem::fill_exponential(q, reinterpret_cast<double *>(d.p), 0, r).wait();
         tandem::fill_exponential(q, reinterpret_cast<float *>(d.p), 0, r).wait();
@@ -1095,7 +1177,8 @@ int main(int argc, char **argv) {
     check_complex<double>(q);
     test_buffers(q);
     test_below(q);
-    test_normal(q);
+    test_normal64(q);
+    test_normal32(q);
     test_exponential(q);
     test_positions(q);
     if (failures) {

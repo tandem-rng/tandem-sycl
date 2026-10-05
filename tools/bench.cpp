@@ -90,8 +90,9 @@ int main(int argc, char **argv) {
             q, tandem::detail::UsmOut<uint32_t>{static_cast<uint32_t *>(buf)}, n, r,
             Kernel::Chunk, {}, 1000u);
     });
-    /* Normal fills from stream word w: an odd w for float or an odd Float64 draw for double
-     * shifts the pairs within the blocks, and w = 4 or 6 puts the first block at lane 1. */
+    /* Normal fills from stream word w: an odd w for float shifts the pairs within the blocks, an
+     * odd Float64 draw for double puts the output 8 bytes off the blocks, and w = 4 or 6 puts the
+     * first block at lane 1. */
     auto normal_row = [&](const char *label, auto tag, uint64_t w) {
         using E = decltype(tag);
         row(label, sizeof(E), [&](size_t n) {
