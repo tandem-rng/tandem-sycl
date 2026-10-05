@@ -467,25 +467,50 @@ struct NormalMiss {
     uint64_t e, r; /* element index, draw */
 };
 
-struct NormalQueue {
+/* The two fast-path values of one block. */
+struct Pair64 {
+    double v[2];
+};
+
+/* How a kernel passes values between the lanes of a group. Auto takes shuffles on devices whose
+ * sub-group sizes are all multiples of eight, so that a sub-group holds whole groups. */
+enum class Exchange { Auto, Shuffle, Local };
+
+/* The local memory of normal64_octet_body: the miss queue, for a shifted start the first row of
+ * each group and of the group after the work group, and without shuffles two steps of the
+ * blocks passed between lanes. */
+template <bool SHIFTED, bool SHUFFLE> struct NormalLocal {
     NormalMiss queue[NORMAL_QUEUE];
-    double firsts[TILE_ITEMS / 8]; /* each sub-group's first low element */
+    Pair64 first[SHIFTED ? TILE_ITEMS + 8u : 1u];
+    Pair64 xbuf[SHIFTED && !SHUFFLE ? 2u * TILE_ITEMS : 1u];
     uint64_t base;
     uint32_t queued;
 };
 
-/* The table pass, one work item per chunk as in tandem-cuda: each step leaves a block as one
- * 16-byte store. When the output is 8 bytes off the stream's blocks and sub-groups hold whole
- * groups (SHUFFLE), each step stores the previous block's high element with the low element that
- * follows it in the stream, taken by a shuffle, so that every group writes whole 16-byte pairs.
- * Then every work item of a sub-group takes every step, so that the shuffles see the whole
- * sub-group. Without shuffles each element leaves alone. */
-template <bool ALIGNED, bool SHUFFLE>
-inline void normal64_rows_body(double *out, const Span &s, sycl::nd_item<1> it, NormalQueue &lm,
-                               NormalMiss *list, unsigned long long *count, uint64_t cap) {
-    const unsigned rank = (unsigned)it.get_local_id(0);
-    const uint64_t c = 8u * s.g0 + it.get_global_id(0), row = (c >> 3) * s.K;
-    const unsigned lane = (unsigned)(c & 7u);
+/* The table pass, one work item per chunk as in tandem-cuda, with the stores of the float normal
+ * fill's octets (normal_group_body). Each work item takes the fast path of its own block's two
+ * draws and queues their misses. The fill is cut into units of two elements from its first draw
+ * D0: unit u is 16 output bytes at element 2u and starts at draw KD = D0 % 2 of block B0 + u,
+ * B0 = D0 / 2. Lane l of a group writes unit 8m + l of octet m, so the eight lanes write 128
+ * aligned bytes whatever the start. With d = B0 % 8 the octet's units start in row R from lane d
+ * on and in row R + 1 below lane d, so a group writes the octet of row R one step later, when row
+ * R + 1 is out, and passes the values between lanes as the float fill passes words. A start
+ * 16 bytes off the lines cost the stores a fifth sector per group and step, a third of the
+ * speed. KD and SHIFTED (KD != 0 or d != 0) are template parameters, as in the float fill. */
+template <unsigned KD, bool SHIFTED, bool SHUFFLE>
+inline void normal64_octet_body(double *out, const Span &s, sycl::nd_item<1> it,
+                                NormalLocal<SHIFTED, SHUFFLE> &lm, NormalMiss *list,
+                                unsigned long long *count, uint64_t cap) {
+    const unsigned rank = (unsigned)it.get_local_id(0), gi = rank >> 3, lane = rank & 7u;
+    const uint64_t gb = s.g0 + (uint64_t)it.get_group(0) * TILE_GROUPS, g = gb + gi;
+    const bool mine = g <= s.g1;
+    const uint64_t D0 = s.p0 >> 6, n = (s.p1 - s.p0) >> 6, units = (n + 1u) / 2u;
+    const uint64_t B0 = D0 >> 1, R0 = B0 >> 3; /* octet m lies at rows R0 + m and R0 + m + 1 */
+    const unsigned d = (unsigned)(B0 & 7u);
+    const bool wide = (reinterpret_cast<uintptr_t>(out) & 15u) == 0;
+    /* The lanes of this lane's unit's first and second block, and whether each lies in R + 1. */
+    const unsigned la = (d + lane) & 7u, lb = (d + lane + 1u) & 7u;
+    const bool na = d + lane >= 8u, nb = d + lane + 1u >= 8u;
     sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
                      sycl::access::address_space::local_space>
         queued(lm.queued);
@@ -494,101 +519,113 @@ inline void normal64_rows_body(double *out, const Span &s, sycl::nd_item<1> it, 
         listed(*count);
     if (rank == 0)
         lm.queued = 0;
+    uint32_t o[4], h[4];
+    F_keyed(s.key.w, 8u * g + lane, DOMAIN_STREAM, AUX_STREAM, o, h);
+    if (SHIFTED && rank < 8u) {
+        uint32_t w[4];
+        block(s.key.w, 8u * (gb + TILE_GROUPS) + rank, 0, w);
+        bool hit;
+        for (unsigned k = 0; k < 2; k++)
+            lm.first[TILE_ITEMS + rank].v[k] = normal64_fast(s.wk, elem<normal64>::draw(w, k), hit);
+    }
     sycl::group_barrier(it.get_group());
-    auto in = [&](uint64_t q) { return q >= s.p0 && q < s.p1; };
-    const bool valid = c < 8u * (s.g1 + 1u);
-    constexpr bool all_steps = !ALIGNED && SHUFFLE;
-    if (valid || all_steps) {
-        uint32_t o[4], h[4];
-        F_keyed(s.key.w, c, DOMAIN_STREAM, AUX_STREAM, o, h);
-        uint32_t j0 = row < s.r0 ? (uint32_t)(s.r0 - row) : 0u;
-        uint32_t j1 = (uint32_t)(s.r1 - row < s.K - 1u ? s.r1 - row : s.K - 1u);
-        const uint32_t steps = all_steps ? s.K : j1 + 1u;
-        /* The two elements at stream bit q, as one 16-byte store when both are in the fill. */
-        auto store_two = [&](uint64_t q, double a, double b) {
-            if (in(q) && in(q + 64u)) {
-                const double z[2] = {a, b};
-                store_wide<16>(out + (q - s.p0) / 64u, z);
-                return;
-            }
-            if (in(q))
-                out[(q - s.p0) / 64u] = a;
-            if (in(q + 64u))
-                out[(q + 64u - s.p0) / 64u] = b;
-        };
-        double z0 = 0.0, z1 = 0.0, first = 0.0; /* for all_steps: the previous step's block, and
-                                                * the low element at step 0 */
-        uint64_t Pp = 0;
-        for (uint32_t j = 0; j < steps; j++) {
-            T(o, h);
-            const bool act = valid && j >= j0 && j <= j1;
-            uint64_t P = (row + j) * 1024u + lane * 128u;
-            double x[2] = {0.0, 0.0};
-            for (unsigned k = 0; act && k < 2; k++) {
-                uint64_t r = elem<normal64>::draw(o, k), q = P + 64u * k;
-                bool hit;
-                x[k] = normal64_fast(s.wk, r, hit);
-                if (!hit && in(q)) {
-                    NormalMiss m{(q - s.p0) / 64u, r};
-                    uint32_t at = queued.fetch_add(1u);
-                    if (at < NORMAL_QUEUE) {
-                        lm.queue[at] = m;
-                    } else {
-                        uint64_t t = listed.fetch_add(1ull);
-                        if (t < cap)
-                            list[t] = m;
-                    }
-                }
-            }
-            if constexpr (all_steps) {
-                /* One step late: the previous block's high element with the low element of
-                 * lane l + 1's previous block, or for lane 7 of lane 0's current one, which
-                 * follows it in the stream. A group's first low element waits for the end. */
-                auto sg = it.get_sub_group();
-                const unsigned id = (unsigned)sg.get_local_linear_id();
-                const double lo = sycl::select_from_group(sg, lane ? z0 : x[0],
-                                                          lane < 7u ? id + 1u : id - 7u);
-                if (j == 0) {
-                    first = x[0];
-                    if (rank == 0 && in(P))
-                        out[(P - s.p0) / 64u] = x[0];
+
+    /* Step j of this lane's chunk: the fast path of its block, its misses queued. */
+    auto step = [&](uint32_t j, Pair64 &x) {
+        if (!mine)
+            return;
+        T(o, h);
+        const uint64_t P = (g * s.K + j) * 1024u + lane * 128u;
+        for (unsigned k = 0; k < 2; k++) {
+            const uint64_t r = elem<normal64>::draw(o, k), q = P + 64u * k;
+            bool hit;
+            x.v[k] = normal64_fast(s.wk, r, hit);
+            if (!hit && q >= s.p0 && q < s.p1) {
+                NormalMiss m{(q - s.p0) / 64u, r};
+                uint32_t at = queued.fetch_add(1u);
+                if (at < NORMAL_QUEUE) {
+                    lm.queue[at] = m;
                 } else {
-                    store_two(Pp + 64u, z1, lo);
-                }
-                z0 = x[0], z1 = x[1], Pp = P;
-            } else {
-                if (!act)
-                    continue;
-                if (ALIGNED && P >= s.p0 && P + 128u <= s.p1) {
-                    store_wide<16>(out + (P - s.p0) / 64u, x);
-                } else {
-                    for (unsigned k = 0; k < 2; k++)
-                        if (in(P + 64u * k))
-                            out[(P + 64u * k - s.p0) / 64u] = x[k];
+                    uint64_t t = listed.fetch_add(1ull);
+                    if (t < cap)
+                        list[t] = m;
                 }
             }
         }
-        if constexpr (all_steps) {
-            /* The last row's high elements. Lane 7's pairs with the next group's first low
-             * element, which follows it in the stream: from the sub-group, or for its last
-             * work item from the next sub-group through local memory. Only the work group's
-             * last high element leaves alone. */
+    };
+    /* Unit 8 (R - R0) + lane: element t is value (t + KD) % 2 of its first block (t + KD < 2)
+     * or of its second, taken from row R + 1 (late) or row R (early). */
+    auto emit = [&](uint64_t R, const Pair64 &late, const Pair64 &early) {
+        if (R < R0 || 8u * (R - R0) + lane >= units)
+            return;
+        const uint64_t e = 2u * (8u * (R - R0) + lane);
+        double z[2];
+        for (unsigned t = 0; t < 2; t++) {
+            const unsigned k = (t + KD) & 1u;
+            z[t] = (t + KD < 2u ? na : nb) ? late.v[k] : early.v[k];
+        }
+        if (wide && e + 2u <= n) {
+            store_wide<16>(out + e, z);
+        } else {
+            for (unsigned t = 0; t < 2; t++)
+                if (e + t < n)
+                    out[e + t] = z[t];
+        }
+    };
+    /* Value k of the block of lane la (k >= KD) or lb (k < KD). Every work item calls it. */
+    auto fetch = [&](unsigned buf, const Pair64 &own, Pair64 &x) {
+        if constexpr (SHUFFLE) {
+            (void)buf;
             auto sg = it.get_sub_group();
-            const unsigned id = (unsigned)sg.get_local_linear_id();
-            const unsigned size = (unsigned)sg.get_local_linear_range();
-            const unsigned sgi = (unsigned)sg.get_group_linear_id();
-            if (id == 0)
-                lm.firsts[sgi] = first;
+            unsigned base = (unsigned)sg.get_local_linear_id() - lane;
+            for (unsigned k = 0; k < 2; k++)
+                x.v[k] = sycl::select_from_group(sg, own.v[k], base + (k >= KD ? la : lb));
+        } else if constexpr (SHIFTED) {
+            Pair64 *xa = lm.xbuf + buf * TILE_ITEMS;
+            xa[rank] = own;
             sycl::group_barrier(it.get_group());
-            double lo = sycl::select_from_group(sg, lane ? z0 : first, id + 1u < size ? id + 1u : id);
-            const bool next = id + 1u < size || sgi + 1u < (unsigned)sg.get_group_linear_range();
-            if (id + 1u == size && next)
-                lo = lm.firsts[sgi + 1u];
-            if (lane < 7u || next)
-                store_two(Pp + 64u, z1, lo);
-            else if (in(Pp + 64u))
-                out[(Pp + 64u - s.p0) / 64u] = z1;
+            for (unsigned k = 0; k < 2; k++)
+                x.v[k] = xa[rank - lane + (k >= KD ? la : lb)].v[k];
         }
+    };
+
+    /* Whether step j has a row in the fill, the same for the whole work group. */
+    auto live = [&](uint32_t j) { return j < s.K && gb * s.K + j <= s.r1; };
+    Pair64 own{{0.0, 0.0}};
+    if constexpr (!SHIFTED) {
+        /* Units are the blocks themselves. */
+        for (uint32_t j = 0; live(j); j++) {
+            step(j, own);
+            if (mine)
+                emit(g * s.K + j, own, own);
+        }
+    } else {
+        /* Step 0 is peeled so that the loop holds no test for it. */
+        uint32_t j = 0;
+        Pair64 prev{{0.0, 0.0}};
+        if (live(0)) {
+            step(0, own);
+            lm.first[gi * 8u + lane] = own;
+            fetch(0, own, prev);
+            for (j = 1; live(j); j++) {
+                step(j, own);
+                Pair64 cur;
+                fetch(j & 1u, own, cur);
+                if (mine)
+                    emit(g * s.K + j - 1u, cur, prev);
+                prev = cur;
+            }
+        }
+        /* The octet of the last row stepped. Its row R + 1 is the next group's first row after
+         * a whole group, and after a loop cut short lies past the fill, so the units that need
+         * it are past the fill too. */
+        sycl::group_barrier(it.get_group());
+        const Pair64 *next = lm.first + (gi + 1u) * 8u;
+        Pair64 cur;
+        for (unsigned k = 0; k < 2; k++)
+            cur.v[k] = next[k >= KD ? la : lb].v[k];
+        if (mine && j > 0)
+            emit(g * s.K + j - 1u, cur, prev);
     }
     sycl::group_barrier(it.get_group());
     const uint32_t m = sycl::min(lm.queued, NORMAL_QUEUE);
@@ -712,12 +749,40 @@ inline NormalScratch &normal_scratch(sycl::queue &q, uint64_t cap) {
     return s;
 }
 
+template <unsigned KD, bool SHIFTED, bool SHUFFLE, class Out>
+sycl::event fill_normal64_table(sycl::queue &q, const Span &t, const Out &out, sycl::event zero,
+                                NormalMiss *list, unsigned long long *count, uint64_t cap) {
+    const uint64_t teams = (t.g1 - t.g0 + TILE_GROUPS) / TILE_GROUPS;
+    return q.submit([&](sycl::handler &h) {
+        h.depends_on(zero);
+        auto dst = bind(out, h);
+        sycl::local_accessor<NormalLocal<SHIFTED, SHUFFLE>, 1> lm(sycl::range<1>(1), h);
+        h.parallel_for(sycl::nd_range<1>(teams * TILE_ITEMS, TILE_ITEMS), [=](sycl::nd_item<1> it) {
+            normal64_octet_body<KD, SHIFTED, SHUFFLE>(
+                dst.get(), t, it, *lm.template get_multi_ptr<sycl::access::decorated::no>().get(),
+                list, count, cap);
+        });
+    });
+}
+
+template <bool SHUFFLE, class Out>
+sycl::event fill_normal64_table(sycl::queue &q, const Span &t, const Out &out, sycl::event zero,
+                                NormalMiss *list, unsigned long long *count, uint64_t cap) {
+    const uint64_t D0 = t.p0 >> 6;
+    if (D0 & 1u)
+        return fill_normal64_table<1, true, SHUFFLE>(q, t, out, zero, list, count, cap);
+    if (((D0 >> 1) & 7u) != 0)
+        return fill_normal64_table<0, true, SHUFFLE>(q, t, out, zero, list, count, cap);
+    return fill_normal64_table<0, false, SHUFFLE>(q, t, out, zero, list, count, cap);
+}
+
 /* The two kernels, with room for at most list_cap misses, n / 128 by default, which a fill
  * exceeds with negligible probability. The tests take a smaller list to run the walk. */
 template <class Out>
 sycl::event fill_normal64_list(sycl::queue &q, const Span &s, const Out &out,
                                const std::vector<sycl::event> &deps,
-                               uint64_t list_cap = ~(uint64_t)0) {
+                               uint64_t list_cap = ~(uint64_t)0,
+                               Exchange exchange = Exchange::Auto) {
     const uint64_t n = (s.p1 - s.p0) / 64u;
     const uint64_t want = std::min(n / 128u, list_cap);
     const uint64_t items = (n / 200u + TILE_ITEMS - 1u) / TILE_ITEMS * TILE_ITEMS;
@@ -730,25 +795,10 @@ sycl::event fill_normal64_list(sycl::queue &q, const Span &s, const Out &out,
     t.wk = sc.wk;
     NormalMiss *list = sc.list;
     unsigned long long *count = sc.count;
-    const uint64_t chunks = 8u * (s.g1 - s.g0 + 1u);
-    const bool shuffle = subgroups_hold_groups(q.get_device());
-    sycl::event table = q.submit([&](sycl::handler &h) {
-        h.depends_on(zero);
-        auto dst = bind(out, h);
-        sycl::local_accessor<NormalQueue, 1> lm(sycl::range<1>(1), h);
-        h.parallel_for(sycl::nd_range<1>((chunks + TILE_ITEMS - 1u) / TILE_ITEMS * TILE_ITEMS, TILE_ITEMS),
-                       [=](sycl::nd_item<1> it) {
-                           double *p = dst.get();
-                           NormalQueue &l =
-                               *lm.template get_multi_ptr<sycl::access::decorated::no>().get();
-                           if (blocks_aligned<normal64>(p, t))
-                               normal64_rows_body<true, false>(p, t, it, l, list, count, want);
-                           else if (shuffle)
-                               normal64_rows_body<false, true>(p, t, it, l, list, count, want);
-                           else
-                               normal64_rows_body<false, false>(p, t, it, l, list, count, want);
-                       });
-    });
+    const bool shuffle = exchange == Exchange::Shuffle ||
+                         (exchange == Exchange::Auto && subgroups_hold_groups(q.get_device()));
+    sycl::event table = shuffle ? fill_normal64_table<true>(q, t, out, zero, list, count, want)
+                                : fill_normal64_table<false>(q, t, out, zero, list, count, want);
     const Key sub = Rng::from_key(s.key, 0, s.K).sub(PURPOSE_NORMAL64).key();
     sc.last = q.submit([&](sycl::handler &h) {
         h.depends_on(table);
@@ -1054,10 +1104,6 @@ inline void normal_group_body(float *dst, const Span &s, sycl::nd_item<1> it, Bl
             emit(g * s.K + j - 1u, cur, prev);
     }
 }
-
-/* How normal_group_body passes blocks between lanes. Auto takes shuffles on devices whose
- * sub-group sizes are all multiples of eight, so that a sub-group holds whole groups. */
-enum class Exchange { Auto, Shuffle, Local };
 
 template <unsigned KW, bool SHIFTED, bool SHUFFLE, class Out>
 sycl::event fill_normal_group_kw(sycl::queue &q, const Span &s, const Out &out,

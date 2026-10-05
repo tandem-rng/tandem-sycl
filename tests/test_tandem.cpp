@@ -873,6 +873,43 @@ static void check_normal64_overflow(sycl::queue &q) {
         }
 }
 
+// The table pass writes octets from the fill's first draw D0: every D0 % 16, which sets the
+// block's lane and the draw within it, then K = 1, whose every octet takes the next group's first
+// row, and outputs on and 8 bytes off 16-byte addresses, with each way of passing values.
+static void check_normal64_octets(sycl::queue &q) {
+    using tandem::detail::Exchange;
+    constexpr size_t n = 70001;
+    const Key key = Rng(8, 9).key();
+    std::vector<Exchange> exchanges = {Exchange::Local};
+    if (tandem::detail::subgroups_hold_groups(q.get_device()))
+        exchanges.push_back(Exchange::Shuffle);
+    for (uint64_t D0 : {0ull, 1ull, 2ull, 3ull, 4ull, 5ull, 6ull, 7ull, 8ull, 9ull, 10ull, 11ull,
+                        12ull, 13ull, 14ull, 15ull, (1ull << 30) + 3})
+        for (uint32_t K : {1u, 32u}) {
+            Rng r = Rng::from_key(key, 64 * D0, K);
+            std::vector<double> want(n);
+            for (double &x : want)
+                x = r.normal();
+            for (size_t shift : {0, 1})
+                for (Exchange ex : exchanges) {
+                    Dev<double> d(q, n + 1);
+                    Rng g = Rng::from_key(key, 64 * D0, K);
+                    tandem::detail::Span s;
+                    tandem::detail::plan_span(g, n, 64, 64, s);
+                    tandem::detail::set_rows(s, s.p0 >> 7, (s.p1 - 1) >> 7);
+                    tandem::detail::fill_normal64_list(
+                        q, s, tandem::detail::UsmOut<double>{d.p + shift}, {}, ~0ull, ex)
+                        .wait();
+                    bool ok = same_bits(d.host(n, shift), want);
+                    CHECK(ok);
+                    if (!ok)
+                        std::printf("  f64 normal octets (D0=%llu K=%u shift=%zu %s)\n",
+                                    (unsigned long long)D0, K, shift,
+                                    ex == Exchange::Local ? "local" : "shuffle");
+                }
+        }
+}
+
 static uint64_t fnv1a(uint64_t h, const void *p, size_t n) {
     const unsigned char *b = static_cast<const unsigned char *>(p);
     for (size_t i = 0; i < n; i++)
@@ -886,6 +923,7 @@ static void test_normal64(sycl::queue &q) {
     check_normal64(q);
     check_normal64_cut(q);
     check_normal64_overflow(q);
+    check_normal64_octets(q);
 
     const Key k42 = Rng(42).key();
     for (Kernel kernel : KERNELS)
