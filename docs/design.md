@@ -18,18 +18,31 @@ Double normals are the 1024-layer ziggurat of Appendix A, one UInt64 draw per el
 `core.hpp`, so `Rng::normal`, the fills, tandem-c and tandem-cuda agree bit for bit. Element
 `i` of a fill takes draw `i`. A draw that misses the fast path, 0.43 % of them, continues on
 `split(g)` of `sub(PURPOSE_NORMAL64)` of the key at position 0, where `g` is the draw's global
-index, so a fill cut at any element equals the whole fill. The fill runs on the uniform fill's
-kernels with two changes:
+index, so a fill cut at any element equals the whole fill.
 
+On GPUs, fills of 2^16 elements or more run tandem-cuda's two kernels:
+
+- The table pass steps one chunk per work item and writes the fast path's values. It queues
+  the work group's misses in local memory and appends them to a list in device memory with one
+  atomic add.
+- The second kernel continues each listed miss, one work item per miss, from the fill's
+  `sub(PURPOSE_NORMAL64)` key, which the host derives once. If the list overflows, the kernel
+  walks the whole fill again.
+- A miss continued in the table pass would run its whole sub-group through the fallback for
+  one lane. Even unexecuted, the call doubles the kernel's registers. That is why the pass makes
+  no calls.
 - A device puts `core.hpp`'s layer table in constant memory, whose reads serialize when the
-  lanes of a sub-group read different layers. That cut the A100 to 27 GiB/s. So the kernels
-  copy the 16 KiB of layers into local memory first.
-- A miss continued in place runs its whole sub-group through the fallback for one lane. Even
-  unexecuted, the call doubles the kernel's registers. So the GPU kernel stages four steps per
-  pass instead of eight, writes the fast path's values, and queues the work group's misses in
-  local memory. The work group continues them one per work item at its end, or after a pass
-  that leaves the queue half full. A pass that overflows the queue continues its misses from
-  the staged blocks. The CPU kernel and `K < 4` continue misses in place.
+  lanes of a sub-group read different layers. That cut the A100 to 27 GiB/s. So the list and a
+  copy of the 16 KiB of layers live in device memory, which the library keeps per context and
+  device. Fills that share it wait for each other through its last event, and the memory lives
+  to the end of the program.
+- When the output is 8 bytes off the stream's 16-byte blocks, each step stores the previous
+  block's high element with the low element that follows it in the stream, by a sub-group
+  shuffle, and a group's last block pairs with the next group's first. So the stores stay whole
+  16-byte pairs.
+
+Shorter fills, CPU devices and devices without 64-bit atomics take the chunk kernel, which
+copies the layers into local memory and continues misses in place.
 
 The float normal fill takes Box-Muller pairs with the logarithm of `core.hpp` and the fast
 `sycl::native::cos` and `sin`, as tandem-cuda takes `__sincosf`, with the angle shifted by half

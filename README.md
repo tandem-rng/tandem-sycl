@@ -9,7 +9,7 @@
 Header-only [SYCL](https://www.khronos.org/sycl/) implementation of
 [Tandem8x32](https://github.com/tandem-rng/spec), a noncryptographic pseudorandom number
 generator. It produces the stream the specification defines, bit for bit, on any SYCL device.
-On the A100 its normal fills write 1314 GiB/s (f32) and 766 GiB/s (f64 ziggurat).
+On the A100 its normal fills write 1314 GiB/s (f32) and 1106 GiB/s (f64 ziggurat).
 
 It needs C++20 and AdaptiveCpp 25.10 or DPC++ 2026.1. The core comes from tandem-cuda
 `0ff5f18`, a submodule in `external/tandem-cuda`.

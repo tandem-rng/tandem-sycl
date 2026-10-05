@@ -8,8 +8,8 @@ pixi run -e cuda test-cuda            # AdaptiveCpp 25.10 for CUDA 12.9, Linux w
 
 ## Suite
 
-`tests/test_tandem.cpp` runs every check on the default SYCL device: 3071 checks on the
-AdaptiveCpp CPU device, 3581 on the A100, which also runs the float normal fill's shuffle
+`tests/test_tandem.cpp` runs every check on the default SYCL device: 3075 checks on the
+AdaptiveCpp CPU device, 3585 on the A100, which also runs the normal fills' shuffle
 variant. It
 checks every vector of the specification, compares fills with both kernels and in-kernel scalar
 draws against reference stream dumps in `tests/data` (from tandem-cuda), compares fills against
@@ -25,7 +25,8 @@ positions 0, 1 and 12345 bits, with rejected draws. A bounded fill cut at an ele
 must equal the whole fill at unaligned nonzero starts with ranges that reject a quarter of the
 draws. Double normal fills of both kernels must equal the scalar `normal()` calls bit for bit
 at random keys, chunk lengths, positions, lengths and alignments, with misses and tail values
-among them. A fill cut at an odd element, at its first miss and just after must equal the
+among them. A miss list too short for the fill must make the second kernel walk the fill and
+give the same values. A fill cut at an odd element, at its first miss and just after must equal the
 whole. They must equal tandem-cuda's `tests/cross_fill_normal.h`, and the FNV-1a hash of 10^6
 normals from five starts must equal tandem-c's `a61cfa844c85f7c1`. Float normal
 fills of every kernel variant are checked against the scalar `normalf2()` calls to 16 ulps plus
