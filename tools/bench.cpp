@@ -1,11 +1,15 @@
-// Fill throughput on the default SYCL device, GiB/s written. Each row runs eight back-to-back
-// fills on an in-order queue and one wait, after a half-second warm-up, and keeps the minimum
-// time of 15 runs. Every fill starts at position 0 unless its label says otherwise. An argument
-// keeps the rows whose label contains it.
+// Fill throughput on the default SYCL device, GiB/s written, by tandem-cuda's method. Each row and
+// length first runs its own fill for two seconds, so the device reaches that fill's steady clocks
+// and power whatever ran before, then times 21 fills, each to the queue's wait, and prints the
+// median and the fastest. docs/speed.md gives the median. Every fill starts at position 0 unless
+// its label says otherwise. An argument keeps the rows whose label contains it, and a row run
+// alone gives the figures it gives in the table.
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <vector>
 
 #include <tandem/sycl.hpp>
 
@@ -16,17 +20,25 @@ static double seconds_since(clock_type::time_point t0) {
     return std::chrono::duration<double>(clock_type::now() - t0).count();
 }
 
-static double best_gibs(sycl::queue &q, size_t bytes, const std::function<void()> &fill) {
-    constexpr int per_run = 8, runs = 15;
-    double best = 1e30;
-    for (int r = 0; r < runs; r++) {
-        auto t0 = clock_type::now();
-        for (int i = 0; i < per_run; i++)
-            fill();
+struct Rate {
+    double median, best; /* GiB/s */
+};
+
+static Rate rate(sycl::queue &q, size_t bytes, const std::function<void()> &fill) {
+    for (auto t0 = clock_type::now(); seconds_since(t0) < 2.0;) {
+        fill();
         q.wait();
-        best = std::min(best, seconds_since(t0));
     }
-    return (double)bytes * per_run / best / (1024.0 * 1024.0 * 1024.0);
+    std::vector<double> s(21);
+    for (double &t : s) {
+        auto t0 = clock_type::now();
+        fill();
+        q.wait();
+        t = seconds_since(t0);
+    }
+    std::sort(s.begin(), s.end());
+    auto gibs = [&](double t) { return (double)bytes / t / (1024.0 * 1024.0 * 1024.0); };
+    return Rate{gibs(s[10]), gibs(s[0])};
 }
 
 int main(int argc, char **argv) {
@@ -47,18 +59,15 @@ int main(int argc, char **argv) {
             kernel, {});
     };
 
-    for (auto t0 = clock_type::now(); seconds_since(t0) < 0.5;) {
-        fill(uint32_t{}, max_n, Kernel::Auto);
-        q.wait();
-    }
-
-    std::printf("%-40s %10s %10s\n", "", "2^26", "2^28");
+    std::printf("%-40s %21s %21s\n", "median, fastest", "2^26", "2^28");
     auto row = [&](const char *label, size_t elem_bytes, auto body) {
         if (!std::strstr(label, only))
             return;
         std::printf("%-40s", label);
-        for (size_t n : {(size_t)1 << 26, max_n})
-            std::printf(" %10.0f", best_gibs(q, n * elem_bytes, [&] { body(n); }));
+        for (size_t n : {(size_t)1 << 26, max_n}) {
+            Rate r = rate(q, n * elem_bytes, [&] { body(n); });
+            std::printf(" %10.0f %10.0f", r.median, r.best);
+        }
         std::printf("\n");
         std::fflush(stdout);
     };
