@@ -33,7 +33,7 @@ card. Narrow types write fewer bytes for the same element count.
 | `fill_normal` `float`, start at word 4 (first block at lane 1) | 1330 | |
 | `fill_normal` `double` | 1106 | 1065 |
 | `fill_normal` `double`, start at an odd Float64 draw | 1043 | 1102 |
-| `fill_normal` `double`, start at word 6 | 708 | |
+| `fill_normal` `double`, start at word 6 | 1043 | |
 | `fill_exponential` `float` | 1099 | 1022 |
 | `fill_exponential` `double` | 895 | 948 |
 
@@ -45,9 +45,10 @@ card, the starts that shift the pairs within the blocks cost 8 % to 9 % against 
 multiple of 32 words.
 
 The double normal rows are the ziggurat with tandem-cuda's two kernels, measured on 2026-10-05
-with the same method. Two runs agreed within 3 %. A start at word 6 puts every group's 128
-bytes 16 bytes off the card's 128-byte lines, so its stores touch five 32-byte sectors per group
-and step instead of four.
+with the same method. Two runs agreed within 3 %. The start at word 6 was remeasured after
+the table pass moved to octet stores, and two runs gave 1030 and 1043. Before, each lane stored
+its own block, which put every group's 128 bytes 16 bytes off the card's 128-byte lines. That
+touched five 32-byte sectors per group and step instead of four and gave 708.
 
 The exponential rows compare against tandem-cuda only, because SYCL has no standard
 exponential sampler.

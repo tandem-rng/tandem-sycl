@@ -36,10 +36,14 @@ On GPUs, fills of 2^16 elements or more run tandem-cuda's two kernels:
   copy of the 16 KiB of layers live in device memory, which the library keeps per context and
   device. Fills that share it wait for each other through its last event, and the memory lives
   to the end of the program.
-- When the output is 8 bytes off the stream's 16-byte blocks, each step stores the previous
-  block's high element with the low element that follows it in the stream, by a sub-group
-  shuffle, and a group's last block pairs with the next group's first. So the stores stay whole
-  16-byte pairs.
+- The table pass stores in octets, as the float normal fill below does. Units of two elements
+  start at the fill's first draw, and the eight lanes of a group write eight consecutive units,
+  128 aligned bytes, one step after their rows are out. When the first draw is not a multiple
+  of 16, the lanes pass the fast path's values by sub-group shuffles, or through local memory.
+  The first draw within its block and whether the start is shifted are template parameters,
+  three kernels. Stores of each lane's own block put a start at word 6 16 bytes off the
+  A100's lines. Each group and step then touched a fifth sector, and the fill ran at
+  two thirds of the speed of an odd start.
 
 Shorter fills, CPU devices and devices without 64-bit atomics take the chunk kernel, which
 copies the layers into local memory and continues misses in place.
