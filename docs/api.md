@@ -46,11 +46,12 @@ q.parallel_for(sycl::range<1>(m), {e1, e2, e3}, [=](sycl::id<1> i) {
   is the draw's global index, the aligned start over 32 (64) plus `i`. A fill without
   rejections equals the sequential `urand(range)` calls, the rare rejection costs no
   coordination, and a fill cut into pieces equals the whole fill.
-- `tandem::fill_normal(queue, ptr, n, rng)`: standard normals in `float` or `double` by
-  Box-Muller, the flattened sequence of `Rng::normalf2` or `Rng::normal2` calls. Pair `j`, the
-  elements `2j` and `2j + 1` with the cos half first, comes from the draws `2j` and `2j + 1` of
-  the Float32 (Float64) fill. An odd count drops the last sin half and still consumes both
-  draws, 64 (128) bits per pair.
+- `tandem::fill_normal(queue, ptr, n, rng)`: standard normals in `float` or `double`. Double:
+  the 1024-layer ziggurat, the sequence of `Rng::normal` calls, element `i` from UInt64 draw
+  `i`, bit for bit equal to tandem-c. Float: Box-Muller, the flattened sequence of
+  `Rng::normalf2` calls. Pair `j`, the elements `2j` and `2j + 1` with the cos half first, comes
+  from the draws `2j` and `2j + 1` of the Float32 fill. An odd count drops the last sin half
+  and still consumes both draws, 64 bits per pair.
 - `tandem::fill_exponential(queue, ptr, n, rng)`: standard exponentials `-log(1 - u)` in
   `float` or `double`, the sequence of `Rng::exponentialf` or `Rng::exponential` calls. Element
   `i` comes from draw `i` of the Float32 (Float64) fill.
@@ -65,8 +66,9 @@ q.parallel_for(sycl::range<1>(m), {e1, e2, e3}, [=](sycl::id<1> i) {
 Every fill returns a `sycl::event` and does not wait. The USM forms take an optional
 `std::vector<sycl::event>` of dependencies as their last argument. The buffer forms take the
 buffer's dependencies from the SYCL runtime. Positions move as in tandem-cuda: an empty
-`fill` aligns the position to the type's width, and an empty `fill_below`, `fill_normal` or
-`fill_exponential` consumes no draws and leaves the position alone. A fill that would run past
+`fill` or double `fill_normal` aligns the position to the type's width, and an empty
+`fill_below`, float `fill_normal` or `fill_exponential` consumes no draws and leaves the
+position alone. A fill that would run past
 stream position 2^64 throws `std::overflow_error` before it moves the position.
 
 ## Rng draws
@@ -76,8 +78,9 @@ stream position 2^64 throws `std::overflow_error` before it moves the position.
 | `bit()`, `urand()`, `urand64()`, `frand()`, `drand()` | the specification's Bool, UInt32, UInt64, Float32 and Float64 draws |
 | `at_urand(i)`, `at_urand64(i)`, `at_frand(i)`, `at_drand(i)` | element `i` of the fill that would start here, without advancing |
 | `urand(range)`, `urand64(range)`, `rand(start, end)`, `rand64(start, end)`, `frand(range)`, `drand(start, end)`, ... | bounded draws, uniform by Lemire's multiply and reject |
-| `normal()`, `normalf()`, `normal(mean, sd)` | the cos half of a Box-Muller step from two Float64 or Float32 draws |
-| `normal2()`, `normalf2()` | both halves of the step as a pair `z0`, `z1` |
+| `normal()`, `normal(mean, sd)` | the ziggurat of one UInt64 draw |
+| `normalf()` | the cos half of a Box-Muller step from two Float32 draws |
+| `normal2()`, `normalf2()` | two ziggurat draws, or both halves of the float step, as a pair `z0`, `z1` |
 | `exponential()`, `exponentialf()` | `-log(1 - u)` of one Float64 or Float32 draw |
 | `split(i)`, `sub(purpose)`, `fork(children, n)` | child generators as the specification defines them |
 | `key()`, `position()`, `set_position(p)`, `chunk_length()` | transport form |

@@ -31,9 +31,9 @@ card. Narrow types write fewer bytes for the same element count.
 | `fill_normal` `float` | 1314 | 1290 |
 | `fill_normal` `float`, start at an odd Float32 draw | 1330 | |
 | `fill_normal` `float`, start at word 4 (first block at lane 1) | 1330 | |
-| `fill_normal` `double` | 839 | 833 |
-| `fill_normal` `double`, start at an odd Float64 draw | 771 | 679 |
-| `fill_normal` `double`, start at word 6 | 782 | |
+| `fill_normal` `double` | 766 | 1065 |
+| `fill_normal` `double`, start at an odd Float64 draw | 712 | 1102 |
+| `fill_normal` `double`, start at word 6 | 699 | |
 | `fill_exponential` `float` | 1099 | 1022 |
 | `fill_exponential` `double` | 895 | 948 |
 
@@ -43,6 +43,13 @@ warms: a second run right after this one gave 1297 for the float normal fill, 11
 start, 821 for the double one and 975 for the float exponentials. Alternating the rows on a warm
 card, the starts that shift the pairs within the blocks cost 8 % to 9 % against a start at a
 multiple of 32 words.
+
+The double normal rows are the ziggurat, measured on 2026-10-05 with the same method. Two runs
+agreed within 0.5 %. They trail tandem-cuda, which continues the misses in a second kernel
+from a list in stream-ordered memory: here a work group continues its own, and the fallback in
+the kernel costs registers and occupancy. Without the fallback the same kernel writes 1078
+GiB/s. An output 8 bytes off the stream's blocks is stored one element at a time, which costs
+7 %.
 
 The exponential rows compare against tandem-cuda only, because SYCL has no standard
 exponential sampler.
