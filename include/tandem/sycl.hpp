@@ -8,12 +8,16 @@
 
 #include <sycl/sycl.hpp>
 
+#include <algorithm>
 #include <bit>
 #include <complex>
 #include <cstring>
 #include <cstdint>
+#include <mutex>
+#include <new>
 #include <stdexcept>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include <tandem/core.hpp>
@@ -271,12 +275,13 @@ inline void store_block(typename elem<Kind>::out_t *out, const Span &s, uint64_t
 }
 
 /* Auto is Tile on GPUs and other accelerators, else Chunk. The uniform and bounded fills take
- * Chunk for K < 8, the double normal fills for K < 4. */
+ * Chunk for K < 8, the double normal fills below 2^16 elements. */
 enum class Kernel {
     Auto,
     Chunk, /* one work item per chunk, one block per step */
-    Tile,  /* one work group per 32 groups: eight steps staged in local memory, or for float
-            * normal fills the units of each row passed between lanes */
+    Tile,  /* one work group per 32 groups: eight steps staged in local memory, for float normal
+            * fills the units of each row passed between lanes, and for double normal fills the
+            * table pass and the miss kernel */
 };
 
 /* The output of a fill as the kernel sees it. A USM pointer is used as is. A buffer is bound
@@ -299,9 +304,12 @@ template <class O, class T, int D> struct BufOut {
     sycl::buffer<T, D> &buf;
 };
 
-template <class O> UsmOut<O> bind(const UsmOut<O> &u, sycl::handler &) { return u; }
+/* `keep` binds a buffer that an earlier kernel of the same fill has written. */
+template <class O> UsmOut<O> bind(const UsmOut<O> &u, sycl::handler &, bool = false) { return u; }
 template <class O, class T, int D>
-AccOut<O, T, D> bind(const BufOut<O, T, D> &b, sycl::handler &h) {
+AccOut<O, T, D> bind(const BufOut<O, T, D> &b, sycl::handler &h, bool keep = false) {
+    if (keep)
+        return AccOut<O, T, D>{sycl::accessor(b.buf, h, sycl::write_only)};
     return AccOut<O, T, D>{sycl::accessor(b.buf, h, sycl::write_only, sycl::no_init)};
 }
 
@@ -432,137 +440,324 @@ sycl::event fill_tile(sycl::queue &q, const Span s, const Out &out,
     });
 }
 
-/* The tile kernel of the f64 normals. A miss inline runs its sub-group through the fallback for
- * one lane, and a quarter of the sub-groups meet one per pass, which halves the speed. So the
- * passes write the fast path's values and queue the work group's misses in local memory, and
- * the work group then continues the queued misses, one per work item. It does so at its end, or
- * after a pass that leaves the queue half full, so that the work group waits for the fallback's
- * latency about once. A pass that overflows the queue continues its own misses from the tile
- * after the pass instead: a fallback call inside the pass costs the kernel registers and half its
- * speed, even when it never runs. Four steps per pass instead of eight keep the local memory
- * under 48 KB. */
-constexpr unsigned NTILE_STEPS = 4, NTILE_SLOTS = TILE_GROUPS * NTILE_STEPS * 8;
-constexpr unsigned NTILE_MISSES = 256; /* about four times the mean of a work group at K = 32 */
+/* Whether every sub-group size of the device is a multiple of eight, so that a sub-group holds
+ * whole groups of eight chunks. */
+inline bool subgroups_hold_groups(const sycl::device &dev) {
+    auto sizes = dev.get_info<sycl::info::device::sub_group_sizes>();
+    for (size_t z : sizes)
+        if (z % 8u != 0)
+            return false;
+    return !sizes.empty();
+}
+
+/* The f64 normal fill on GPUs, the two kernels of tandem-cuda. The table pass writes the fast
+ * path's values and queues the work group's misses, 0.43 % of the elements, in local memory. At
+ * its end the work group appends the queue to a list in device memory with one atomic add, and a
+ * miss past the queue goes to the list directly. The second kernel continues each listed miss,
+ * one work item per miss, so the table pass makes no calls and keeps its registers. When the
+ * list overflows, the second kernel walks the whole fill again and continues every miss.
+ *
+ * The list and a copy of the layers live in device memory kept per context and device, and the
+ * fills that share it chain on its last event. A device puts zig::WK in constant memory, whose
+ * reads serialize when the lanes read different layers. */
+constexpr unsigned NORMAL_QUEUE = 256; /* per work group, four times the mean at K = 32 */
+constexpr uint64_t NORMAL_LIST_MIN = (uint64_t)1 << 16; /* shorter fills take the chunk kernel */
 
 struct NormalMiss {
     uint64_t e, r; /* element index, draw */
 };
 
-struct NormalTile {
-    Block tile[NTILE_SLOTS];
-    zig::Layer wk[1024];
-    NormalMiss miss[NTILE_MISSES];
-    uint32_t misses, start; /* queued, and queued before the pass */
+struct NormalQueue {
+    NormalMiss queue[NORMAL_QUEUE];
+    double firsts[TILE_ITEMS / 8]; /* each sub-group's first low element */
+    uint64_t base;
+    uint32_t queued;
 };
 
-template <bool ALIGNED>
-inline void normal64_tile_body(double *out, const Span &s0, sycl::nd_item<1> it, NormalTile &lm) {
-    const Span s = with_layers(s0, it, lm.wk);
-    uint64_t gb = s.g0 + (uint64_t)it.get_group(0) * TILE_GROUPS;
-    unsigned rank = (unsigned)it.get_local_id(0), gi = rank >> 3, lane = rank & 7u;
-    bool mine = gb + gi <= s.g1;
-    uint32_t o[4], h[4];
-    F_keyed(s.key.w, 8u * (gb + gi) + lane, DOMAIN_STREAM, AUX_STREAM, o, h);
+/* The table pass, one work item per chunk as in tandem-cuda: each step leaves a block as one
+ * 16-byte store. When the output is 8 bytes off the stream's blocks and sub-groups hold whole
+ * groups (SHUFFLE), each step stores the previous block's high element with the low element that
+ * follows it in the stream, taken by a shuffle, so that every group writes whole 16-byte pairs.
+ * Then every work item of a sub-group takes every step, so that the shuffles see the whole
+ * sub-group. Without shuffles each element leaves alone. */
+template <bool ALIGNED, bool SHUFFLE>
+inline void normal64_rows_body(double *out, const Span &s, sycl::nd_item<1> it, NormalQueue &lm,
+                               NormalMiss *list, unsigned long long *count, uint64_t cap) {
+    const unsigned rank = (unsigned)it.get_local_id(0);
+    const uint64_t c = 8u * s.g0 + it.get_global_id(0), row = (c >> 3) * s.K;
+    const unsigned lane = (unsigned)(c & 7u);
     sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
                      sycl::access::address_space::local_space>
-        misses(lm.misses);
+        queued(lm.queued);
+    sycl::atomic_ref<unsigned long long, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                     sycl::access::address_space::global_space>
+        listed(*count);
     if (rank == 0)
-        lm.misses = 0;
-    /* Continue queue entries [0, count). The caller has passed a barrier since the last push. */
-    auto drain = [&](uint32_t count) {
-        for (uint32_t i = rank; i < count; i += TILE_ITEMS) {
-            NormalMiss m = lm.miss[i];
-            out[m.e] = normal_f64_slow(m.r, s.key.w, s.K, s.p0 / 64u + m.e);
-        }
-    };
-    /* The stream bit of slot u's block in pass jb. */
-    auto bit_of = [&](unsigned u, uint32_t jb) {
-        unsigned sg = u / (NTILE_STEPS * 8), within = u % (NTILE_STEPS * 8);
-        return ((gb + sg) * s.K + jb) * 1024u + within * 128u;
-    };
-    const uint64_t first_bit = gb * s.K * 1024u;
-    for (uint32_t jb = 0; jb < s.K; jb += NTILE_STEPS) {
-        if (first_bit + jb * 1024u >= s.p1)
-            break;
-        if (mine) {
-            for (unsigned j = 0; j < NTILE_STEPS; j++) {
-                T(o, h);
-                lm.tile[(gi * NTILE_STEPS + j) * 8 + lane] = Block{{o[0], o[1], o[2], o[3]}};
+        lm.queued = 0;
+    sycl::group_barrier(it.get_group());
+    auto in = [&](uint64_t q) { return q >= s.p0 && q < s.p1; };
+    const bool valid = c < 8u * (s.g1 + 1u);
+    constexpr bool all_steps = !ALIGNED && SHUFFLE;
+    if (valid || all_steps) {
+        uint32_t o[4], h[4];
+        F_keyed(s.key.w, c, DOMAIN_STREAM, AUX_STREAM, o, h);
+        uint32_t j0 = row < s.r0 ? (uint32_t)(s.r0 - row) : 0u;
+        uint32_t j1 = (uint32_t)(s.r1 - row < s.K - 1u ? s.r1 - row : s.K - 1u);
+        const uint32_t steps = all_steps ? s.K : j1 + 1u;
+        /* The two elements at stream bit q, as one 16-byte store when both are in the fill. */
+        auto store_two = [&](uint64_t q, double a, double b) {
+            if (in(q) && in(q + 64u)) {
+                const double z[2] = {a, b};
+                store_wide<16>(out + (q - s.p0) / 64u, z);
+                return;
             }
-        }
-        if (rank == 0)
-            lm.start = lm.misses;
-        sycl::group_barrier(it.get_group());
-        for (unsigned u = rank; u < NTILE_SLOTS; u += TILE_ITEMS) {
-            uint64_t P = bit_of(u, jb);
-            if (P >= s.p1)
-                continue;
-            double x[2];
-            for (unsigned k = 0; k < 2; k++) {
-                uint64_t r = elem<normal64>::draw(lm.tile[u].w, k), q = P + 64u * k;
+            if (in(q))
+                out[(q - s.p0) / 64u] = a;
+            if (in(q + 64u))
+                out[(q + 64u - s.p0) / 64u] = b;
+        };
+        double z0 = 0.0, z1 = 0.0, first = 0.0; /* for all_steps: the previous step's block, and
+                                                * the low element at step 0 */
+        uint64_t Pp = 0;
+        for (uint32_t j = 0; j < steps; j++) {
+            T(o, h);
+            const bool act = valid && j >= j0 && j <= j1;
+            uint64_t P = (row + j) * 1024u + lane * 128u;
+            double x[2] = {0.0, 0.0};
+            for (unsigned k = 0; act && k < 2; k++) {
+                uint64_t r = elem<normal64>::draw(o, k), q = P + 64u * k;
                 bool hit;
                 x[k] = normal64_fast(s.wk, r, hit);
-                if (hit || q < s.p0 || q >= s.p1)
-                    continue;
-                uint32_t at = misses.fetch_add(1u);
-                if (at < NTILE_MISSES)
-                    lm.miss[at] = NormalMiss{(q - s.p0) / 64u, r};
-            }
-            if (ALIGNED && P >= s.p0 && P + 128u <= s.p1) {
-                store_wide<16>(out + (P - s.p0) / 64u, x);
-                continue;
-            }
-            for (unsigned k = 0; k < 2; k++)
-                if (P + 64u * k >= s.p0 && P + 64u * k < s.p1)
-                    out[(P + 64u * k - s.p0) / 64u] = x[k];
-        }
-        sycl::group_barrier(it.get_group());
-        const uint32_t queued = lm.misses;
-        if (queued > NTILE_MISSES) {
-            /* The entries of earlier passes, then every miss of this one from the tile. */
-            drain(lm.start);
-            for (unsigned u = rank; u < NTILE_SLOTS; u += TILE_ITEMS) {
-                uint64_t P = bit_of(u, jb);
-                for (unsigned k = 0; k < 2; k++) {
-                    uint64_t r = elem<normal64>::draw(lm.tile[u].w, k), q = P + 64u * k;
-                    bool hit;
-                    normal64_fast(s.wk, r, hit);
-                    if (!hit && q >= s.p0 && q < s.p1)
-                        out[(q - s.p0) / 64u] = normal_f64_slow(r, s.key.w, s.K, q / 64u);
+                if (!hit && in(q)) {
+                    NormalMiss m{(q - s.p0) / 64u, r};
+                    uint32_t at = queued.fetch_add(1u);
+                    if (at < NORMAL_QUEUE) {
+                        lm.queue[at] = m;
+                    } else {
+                        uint64_t t = listed.fetch_add(1ull);
+                        if (t < cap)
+                            list[t] = m;
+                    }
                 }
             }
-        } else if (queued >= NTILE_MISSES / 2) {
-            drain(queued);
-        } else {
-            continue;
+            if constexpr (all_steps) {
+                /* One step late: the previous block's high element with the low element of
+                 * lane l + 1's previous block, or for lane 7 of lane 0's current one, which
+                 * follows it in the stream. A group's first low element waits for the end. */
+                auto sg = it.get_sub_group();
+                const unsigned id = (unsigned)sg.get_local_linear_id();
+                const double lo = sycl::select_from_group(sg, lane ? z0 : x[0],
+                                                          lane < 7u ? id + 1u : id - 7u);
+                if (j == 0) {
+                    first = x[0];
+                    if (rank == 0 && in(P))
+                        out[(P - s.p0) / 64u] = x[0];
+                } else {
+                    store_two(Pp + 64u, z1, lo);
+                }
+                z0 = x[0], z1 = x[1], Pp = P;
+            } else {
+                if (!act)
+                    continue;
+                if (ALIGNED && P >= s.p0 && P + 128u <= s.p1) {
+                    store_wide<16>(out + (P - s.p0) / 64u, x);
+                } else {
+                    for (unsigned k = 0; k < 2; k++)
+                        if (in(P + 64u * k))
+                            out[(P + 64u * k - s.p0) / 64u] = x[k];
+                }
+            }
         }
-        sycl::group_barrier(it.get_group());
-        if (rank == 0)
-            lm.misses = 0;
+        if constexpr (all_steps) {
+            /* The last row's high elements. Lane 7's pairs with the next group's first low
+             * element, which follows it in the stream: from the sub-group, or for its last
+             * work item from the next sub-group through local memory. Only the work group's
+             * last high element leaves alone. */
+            auto sg = it.get_sub_group();
+            const unsigned id = (unsigned)sg.get_local_linear_id();
+            const unsigned size = (unsigned)sg.get_local_linear_range();
+            const unsigned sgi = (unsigned)sg.get_group_linear_id();
+            if (id == 0)
+                lm.firsts[sgi] = first;
+            sycl::group_barrier(it.get_group());
+            double lo = sycl::select_from_group(sg, lane ? z0 : first, id + 1u < size ? id + 1u : id);
+            const bool next = id + 1u < size || sgi + 1u < (unsigned)sg.get_group_linear_range();
+            if (id + 1u == size && next)
+                lo = lm.firsts[sgi + 1u];
+            if (lane < 7u || next)
+                store_two(Pp + 64u, z1, lo);
+            else if (in(Pp + 64u))
+                out[(Pp + 64u - s.p0) / 64u] = z1;
+        }
     }
     sycl::group_barrier(it.get_group());
-    drain(lm.misses);
+    const uint32_t m = sycl::min(lm.queued, NORMAL_QUEUE);
+    if (rank == 0)
+        lm.base = m ? listed.fetch_add((unsigned long long)m) : 0;
+    sycl::group_barrier(it.get_group());
+    for (uint32_t i = rank; i < m; i += TILE_ITEMS)
+        if (lm.base + i < cap)
+            list[lm.base + i] = lm.queue[i];
 }
 
+/* normal_f64_slow of core.hpp, operation for operation, from the fill's sub(PURPOSE_NORMAL64)
+ * key, which the host derives once instead of every miss again, and the layers of wk. */
+inline double normal64_continue(uint64_t r, const Key &sub, uint32_t K, uint64_t g,
+                                const zig::Layer *wk) {
+    using namespace detail;
+    Rng fb = Rng::from_key(sub, 0, K).split(g);
+    bool hit;
+    double x = normal64_fast(wk, r, hit);
+    for (;;) {
+        unsigned i = (unsigned)r & 1023u;
+        if (i == 0) {
+            double a, b;
+            do {
+                a = exponential_f64(fb.drand()) / zig::R;
+                b = exponential_f64(fb.drand());
+            } while (b + b < a * a);
+            double t = zig::R + a;
+            return (r >> 10) & 1u ? -t : t;
+        }
+        double y = add_rn(zig_y(i), fmad(fb.drand(), zig_y(i + 1) - zig_y(i), 0.0));
+        if (-0.5 * neg2_log_f64(y) < -0.5 * (x * x))
+            return x;
+        r = fb.urand64();
+        x = normal64_fast(wk, r, hit);
+        if (hit)
+            return x;
+    }
+}
+
+/* The listed misses from work item t of `items`, or all misses of the fill by chunk when the
+ * list overflowed. */
+inline void normal64_miss_body(double *out, const Span &s, const Key &sub, uint64_t t,
+                               uint64_t items, const NormalMiss *list,
+                               const unsigned long long *count, uint64_t cap) {
+    const uint64_t listed = *count;
+    if (listed <= cap) {
+        for (uint64_t i = t; i < listed; i += items)
+            out[list[i].e] = normal64_continue(list[i].r, sub, s.K, s.p0 / 64u + list[i].e, s.wk);
+        return;
+    }
+    for (uint64_t c = 8u * s.g0 + t; c < 8u * (s.g1 + 1u); c += items) {
+        uint64_t row = (c >> 3) * s.K;
+        uint32_t o[4], h[4];
+        F_keyed(s.key.w, c, DOMAIN_STREAM, AUX_STREAM, o, h);
+        uint32_t j0 = row < s.r0 ? (uint32_t)(s.r0 - row) : 0u;
+        uint32_t j1 = (uint32_t)(s.r1 - row < s.K - 1u ? s.r1 - row : s.K - 1u);
+        for (uint32_t j = 0; j <= j1; j++) {
+            T(o, h);
+            for (unsigned k = 0; j >= j0 && k < 2; k++) {
+                uint64_t q = (row + j) * 1024u + (c & 7u) * 128u + 64u * k;
+                uint64_t r = elem<normal64>::draw(o, k);
+                bool hit;
+                normal64_fast(s.wk, r, hit);
+                if (!hit && q >= s.p0 && q < s.p1)
+                    out[(q - s.p0) / 64u] = normal64_continue(r, sub, s.K, q / 64u, s.wk);
+            }
+        }
+    }
+}
+
+/* Device memory for the f64 normal fills of one context and device: the count of listed
+ * misses, a copy of the layers and the list. */
+struct NormalScratch {
+    unsigned long long *count = nullptr;
+    zig::Layer *wk = nullptr;
+    NormalMiss *list = nullptr;
+    uint64_t cap = 0;
+    sycl::event last; /* the last work that uses it */
+};
+
+struct ScratchKey {
+    sycl::context context;
+    sycl::device device;
+    bool operator==(const ScratchKey &) const = default;
+};
+
+struct ScratchHash {
+    size_t operator()(const ScratchKey &k) const {
+        return std::hash<sycl::context>()(k.context) * 31u + std::hash<sycl::device>()(k.device);
+    }
+};
+
+inline std::mutex &normal_scratch_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+/* The scratch of q's context and device with room for cap misses. The caller holds the mutex.
+ * The memory lives to the end of the program: the SYCL runtime may be gone when static
+ * destructors run. */
+inline NormalScratch &normal_scratch(sycl::queue &q, uint64_t cap) {
+    static auto *all = new std::unordered_map<ScratchKey, NormalScratch, ScratchHash>();
+    NormalScratch &s = (*all)[ScratchKey{q.get_context(), q.get_device()}];
+    if (s.count && s.cap >= cap)
+        return s;
+    if (s.count) {
+        s.last.wait();
+        sycl::free(s.count, q.get_context());
+    }
+    cap = std::max(cap, 2 * s.cap);
+    char *m = static_cast<char *>(
+        sycl::malloc_device(16 + sizeof zig::WK + cap * sizeof(NormalMiss), q));
+    if (!m)
+        throw std::bad_alloc();
+    s.count = reinterpret_cast<unsigned long long *>(m);
+    s.wk = reinterpret_cast<zig::Layer *>(m + 16);
+    s.list = reinterpret_cast<NormalMiss *>(m + 16 + sizeof zig::WK);
+    s.cap = cap;
+    s.last = q.memcpy(s.wk, zig::WK, sizeof zig::WK);
+    return s;
+}
+
+/* The two kernels, with room for at most list_cap misses, n / 128 by default, which a fill
+ * exceeds with negligible probability. The tests take a smaller list to run the walk. */
 template <class Out>
-sycl::event fill_normal64_tile(sycl::queue &q, const Span s, const Out &out,
-                               const std::vector<sycl::event> &deps) {
-    uint64_t teams = (s.g1 - s.g0 + TILE_GROUPS) / TILE_GROUPS;
-    return q.submit([&](sycl::handler &h) {
-        h.depends_on(deps);
+sycl::event fill_normal64_list(sycl::queue &q, const Span &s, const Out &out,
+                               const std::vector<sycl::event> &deps,
+                               uint64_t list_cap = ~(uint64_t)0) {
+    const uint64_t n = (s.p1 - s.p0) / 64u;
+    const uint64_t want = std::min(n / 128u, list_cap);
+    const uint64_t items = (n / 200u + TILE_ITEMS - 1u) / TILE_ITEMS * TILE_ITEMS;
+    std::lock_guard<std::mutex> lock(normal_scratch_mutex());
+    NormalScratch &sc = normal_scratch(q, want);
+    std::vector<sycl::event> first = deps;
+    first.push_back(sc.last);
+    sycl::event zero = q.memset(sc.count, 0, sizeof *sc.count, first);
+    Span t = s;
+    t.wk = sc.wk;
+    NormalMiss *list = sc.list;
+    unsigned long long *count = sc.count;
+    const uint64_t chunks = 8u * (s.g1 - s.g0 + 1u);
+    const bool shuffle = subgroups_hold_groups(q.get_device());
+    sycl::event table = q.submit([&](sycl::handler &h) {
+        h.depends_on(zero);
         auto dst = bind(out, h);
-        sycl::local_accessor<NormalTile, 1> lm(sycl::range<1>(1), h);
-        h.parallel_for(sycl::nd_range<1>(teams * TILE_ITEMS, TILE_ITEMS),
+        sycl::local_accessor<NormalQueue, 1> lm(sycl::range<1>(1), h);
+        h.parallel_for(sycl::nd_range<1>((chunks + TILE_ITEMS - 1u) / TILE_ITEMS * TILE_ITEMS, TILE_ITEMS),
                        [=](sycl::nd_item<1> it) {
                            double *p = dst.get();
-                           NormalTile &l =
+                           NormalQueue &l =
                                *lm.template get_multi_ptr<sycl::access::decorated::no>().get();
-                           if (blocks_aligned<normal64>(p, s))
-                               normal64_tile_body<true>(p, s, it, l);
+                           if (blocks_aligned<normal64>(p, t))
+                               normal64_rows_body<true, false>(p, t, it, l, list, count, want);
+                           else if (shuffle)
+                               normal64_rows_body<false, true>(p, t, it, l, list, count, want);
                            else
-                               normal64_tile_body<false>(p, s, it, l);
+                               normal64_rows_body<false, false>(p, t, it, l, list, count, want);
                        });
     });
+    const Key sub = Rng::from_key(s.key, 0, s.K).sub(PURPOSE_NORMAL64).key();
+    sc.last = q.submit([&](sycl::handler &h) {
+        h.depends_on(table);
+        auto dst = bind(out, h, true);
+        h.parallel_for(sycl::range<1>(items), [=](sycl::item<1> it) {
+            normal64_miss_body(dst.get(), t, sub, it.get_id(0), items, list, count, want);
+        });
+    });
+    return sc.last;
 }
 
 /* Set the span of a fill that takes `n` elements of `bits` bits from the generator's position
@@ -605,8 +800,9 @@ sycl::event fill_kind(sycl::queue &q, const Out &out, uint64_t n, Rng &rng, Kern
     if (kernel == Kernel::Auto)
         kernel = q.get_device().is_cpu() ? Kernel::Chunk : Kernel::Tile;
     if constexpr (std::is_same_v<Kind, normal64>) {
-        if (kernel == Kernel::Tile && s.K >= NTILE_STEPS)
-            return fill_normal64_tile(q, s, out, deps);
+        if (kernel == Kernel::Tile && n >= NORMAL_LIST_MIN &&
+            q.get_device().has(sycl::aspect::atomic64))
+            return fill_normal64_list(q, s, out, deps);
     } else if (kernel == Kernel::Tile && s.K >= TILE_STEPS) {
         return fill_tile<Kind>(q, s, out, deps);
     }
@@ -862,14 +1058,6 @@ inline void normal_group_body(float *dst, const Span &s, sycl::nd_item<1> it, Bl
 /* How normal_group_body passes blocks between lanes. Auto takes shuffles on devices whose
  * sub-group sizes are all multiples of eight, so that a sub-group holds whole groups. */
 enum class Exchange { Auto, Shuffle, Local };
-
-inline bool subgroups_hold_groups(const sycl::device &dev) {
-    auto sizes = dev.get_info<sycl::info::device::sub_group_sizes>();
-    for (size_t z : sizes)
-        if (z % 8u != 0)
-            return false;
-    return !sizes.empty();
-}
 
 template <unsigned KW, bool SHIFTED, bool SHUFFLE, class Out>
 sycl::event fill_normal_group_kw(sycl::queue &q, const Span &s, const Out &out,

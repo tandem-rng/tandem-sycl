@@ -850,6 +850,29 @@ static void check_normal64_cut(sycl::queue &q) {
         }
 }
 
+// A miss list too short for the fill's misses makes the second kernel walk the whole fill,
+// with outputs on and 8 bytes off the stream's blocks.
+static void check_normal64_overflow(sycl::queue &q) {
+    constexpr size_t n = 100000;
+    const Key key = Rng(5, 6).key();
+    Rng r = Rng::from_key(key, 77, 32);
+    std::vector<double> want(n);
+    for (double &x : want)
+        x = r.normal();
+    for (uint64_t cap : {0ull, 1ull})
+        for (size_t shift : {0, 1}) {
+            Dev<double> d(q, n + 1);
+            Rng g = Rng::from_key(key, 77, 32);
+            tandem::detail::Span s;
+            tandem::detail::plan_span(g, n, 64, 64, s);
+            tandem::detail::set_rows(s, s.p0 >> 7, (s.p1 - 1) >> 7);
+            tandem::detail::fill_normal64_list(q, s, tandem::detail::UsmOut<double>{d.p + shift},
+                                               {}, cap)
+                .wait();
+            CHECK(same_bits(d.host(n, shift), want) && g.position() == r.position());
+        }
+}
+
 static uint64_t fnv1a(uint64_t h, const void *p, size_t n) {
     const unsigned char *b = static_cast<const unsigned char *>(p);
     for (size_t i = 0; i < n; i++)
@@ -862,6 +885,7 @@ static uint64_t fnv1a(uint64_t h, const void *p, size_t n) {
 static void test_normal64(sycl::queue &q) {
     check_normal64(q);
     check_normal64_cut(q);
+    check_normal64_overflow(q);
 
     const Key k42 = Rng(42).key();
     for (Kernel kernel : KERNELS)
