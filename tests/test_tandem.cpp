@@ -1,6 +1,6 @@
-// Spec vectors, reference stream dumps, fills against in-kernel draws and the u32 stream, split
-// fills, derived keys, bounded, normal and exponential fills against the tandem-cuda fixtures,
-// buffers, and position advancement, on the default SYCL device.
+// Spec vectors, the spec's conformance files, fills against in-kernel draws and the u32 stream,
+// split fills, derived keys, bounded, normal and exponential fills, buffers, and position
+// advancement, on the default SYCL device.
 #include <algorithm>
 #include <cmath>
 #include <complex>
@@ -13,9 +13,7 @@
 
 #include <tandem/sycl.hpp>
 
-#include "../external/tandem-cuda/tests/cross_fill_below.h"
-#include "../external/tandem-cuda/tests/cross_fill_exponential.h"
-#include "../external/tandem-cuda/tests/cross_fill_normal.h"
+#include "conformance.hpp"
 #include "vectors.hpp"
 
 using tandem::Key;
@@ -211,70 +209,63 @@ static void test_vectors(sycl::queue &q) {
         CHECK(su32[v.index] == v.value);
 }
 
-// ---- Dumps --------------------------------------------------------------------------------
+// ---- Stream hashes of hashes.json ---------------------------------------------------------
 
-template <class T> static std::vector<T> slurp(const std::string &dir, const char *file) {
-    std::string path = dir + "/" + file;
-    FILE *f = std::fopen(path.c_str(), "rb");
-    if (!f) {
-        std::printf("FAIL cannot open %s\n", path.c_str());
-        failures++;
-        return {};
-    }
-    std::fseek(f, 0, SEEK_END);
-    size_t len = (size_t)std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    std::vector<T> v(len / sizeof(T));
-    if (std::fread(v.data(), 1, len, f) != len)
-        failures++;
-    std::fclose(f);
-    return v;
+static Key json_key(const Json &words) {
+    Key k;
+    for (int w = 0; w < 4; w++)
+        k.w[w] = (uint32_t)words.items[w].hex();
+    return k;
 }
 
-template <class E>
-static void check_dump_fill(sycl::queue &q, const std::string &dir, const char *file,
-                            const Key &key, uint32_t K) {
-    std::vector<host_t<E>> want = slurp<host_t<E>>(dir, file);
-    if (want.empty())
-        return;
+template <class T> static std::string sha256_of(const std::vector<T> &v) {
+    return sha256_hex(v.data(), v.size() * sizeof(T));
+}
+
+// The fills of both kernels, and the in-kernel scalar draws of the types that have one, hash to
+// the stream's SHA-256. Float16 also as bit patterns, which sycl::half fills write too.
+template <class E> static void check_stream(sycl::queue &q, const Json &s) {
+    const Key key = json_key(s["key"]);
+    const uint32_t K = (uint32_t)s["K"].u64();
+    const uint64_t start = s["start"].u64();
+    const size_t n = s["n"].u64();
+    const std::string &want = s["sha256"].text;
     for (Kernel kernel : KERNELS) {
-        size_t i = first_diff(want, device_fill<E>(q, key, 0, K, want.size(), kernel));
-        CHECK(i == SIZE_MAX);
-        if (i != SIZE_MAX)
-            std::printf("  %s: %s fill differs at %zu\n", file, name(kernel), i);
+        bool ok = sha256_of(device_fill<E>(q, key, start, K, n, kernel)) == want;
+        if constexpr (std::is_same_v<E, sycl::half>)
+            ok = ok && sha256_of(device_f16_bits(q, key, start, K, n, kernel)) == want;
+        CHECK(ok);
+        if (!ok)
+            std::printf("  %s: %s fill hash differs\n", s["file"].text.c_str(), name(kernel));
     }
+    if constexpr (std::is_same_v<E, bool> || std::is_same_v<E, uint32_t> ||
+                  std::is_same_v<E, uint64_t> || std::is_same_v<E, float> ||
+                  std::is_same_v<E, double>)
+        CHECK(sha256_of(device_draws<E>(q, key, start, K, n)) == want);
 }
 
-template <class E>
-static void check_dump(sycl::queue &q, const std::string &dir, const char *file, const Key &key,
-                       uint32_t K) {
-    check_dump_fill<E>(q, dir, file, key, K);
-    std::vector<host_t<E>> want = slurp<host_t<E>>(dir, file);
-    size_t i = first_diff(want, device_draws<E>(q, key, 0, K, want.size()));
-    CHECK(i == SIZE_MAX);
-    if (i != SIZE_MAX)
-        std::printf("  %s: draws differ at %zu\n", file, i);
-}
-
-static void test_dumps(sycl::queue &q, const std::string &dir) {
-    const uint32_t k1234[4] = {1, 2, 3, 4};
-    const Key k = key_of(k1234), s42 = Rng(42).key();
-    check_dump<uint32_t>(q, dir, "k1234_K32_u32.bin", k, 32);
-    check_dump<uint64_t>(q, dir, "k1234_K32_u64.bin", k, 32);
-    check_dump<uint32_t>(q, dir, "k1234_K8_u32.bin", k, 8);
-    check_dump<double>(q, dir, "seed42_K32_f64.bin", s42, 32);
-    check_dump<float>(q, dir, "seed42_K32_f32.bin", s42, 32);
-    check_dump<bool>(q, dir, "seed42_K32_bool.bin", s42, 32);
-    check_dump_fill<uint8_t>(q, dir, "seed42_K32_u8.bin", s42, 32);
-    check_dump_fill<std::complex<float>>(q, dir, "seed42_K32_c32.bin", s42, 32);
-    check_dump_fill<std::complex<double>>(q, dir, "seed42_K32_c64.bin", s42, 32);
-
-    // Float16 as bit patterns and as sycl::half, whose fill writes the same bits.
-    std::vector<uint16_t> f16 = slurp<uint16_t>(dir, "seed42_K32_f16bits.bin");
-    for (Kernel kernel : KERNELS) {
-        CHECK(first_diff(f16, device_f16_bits(q, s42, 0, 32, f16.size(), kernel)) == SIZE_MAX);
-        auto h = device_fill<sycl::half>(q, s42, 0, 32, f16.size(), kernel);
-        CHECK(std::memcmp(h.data(), f16.data(), 2 * f16.size()) == 0);
+// UInt128 and Char have no fill here.
+static void test_streams(sycl::queue &q, const Json &hashes) {
+    for (const Json &s : hashes["streams"].items) {
+        const std::string &type = s["type"].text;
+        if (type == "UInt32")
+            check_stream<uint32_t>(q, s);
+        else if (type == "UInt64")
+            check_stream<uint64_t>(q, s);
+        else if (type == "UInt8")
+            check_stream<uint8_t>(q, s);
+        else if (type == "Bool")
+            check_stream<bool>(q, s);
+        else if (type == "Float32")
+            check_stream<float>(q, s);
+        else if (type == "Float64")
+            check_stream<double>(q, s);
+        else if (type == "Float16")
+            check_stream<sycl::half>(q, s);
+        else if (type == "ComplexF32")
+            check_stream<std::complex<float>>(q, s);
+        else if (type == "ComplexF64")
+            check_stream<std::complex<double>>(q, s);
     }
 }
 
@@ -709,51 +700,8 @@ template <class E> static void check_below(sycl::queue &q, const char *label) {
     }
 }
 
-// A fill cut at an element boundary equals the whole fill, rejected draws included, at
-// unaligned nonzero starts with ranges that reject about a quarter of the draws.
-template <class E> static void check_below_cut(sycl::queue &q) {
-    constexpr size_t n = 300;
-    const E range = (E)3 << (8 * sizeof(E) - 2) | 1u;
-    const Key key = Rng(5, 6).key();
-    for (uint64_t start : {1ull, 12345ull, 100000ull})
-        for (size_t cut : {1, 7, 100, 299})
-            for (Kernel kernel : KERNELS) {
-                uint64_t end_whole, end_a, end_b;
-                auto whole = device_below<E>(q, key, start, 32, n, range, kernel, 0, &end_whole);
-                auto a = device_below<E>(q, key, start, 32, cut, range, kernel, 0, &end_a);
-                auto b = device_below<E>(q, key, end_a, 32, n - cut, range, kernel, 0, &end_b);
-                a.insert(a.end(), b.begin(), b.end());
-                CHECK(first_diff(whole, a) == SIZE_MAX && end_whole == end_b);
-            }
-}
-
-// Without a rejection a bounded fill equals the sequential urand(range) calls. Fixtures from
-// tandem-cuda pin the fallback stream at position 0, where 41 of the 2^31 + 1 elements and 34
-// of the 2^63 + 1 elements reject, and at bit positions 1 and 12345, where g != i.
+// Without a rejection a bounded fill equals the sequential urand(range) calls.
 static void test_below(sycl::queue &q) {
-    check_below_cut<uint32_t>(q);
-    check_below_cut<uint64_t>(q);
-    unsigned rejected = 0;
-    for (const auto &f : CROSS_BELOW32_AT)
-        for (Kernel kernel : KERNELS) {
-            uint64_t end;
-            auto v = device_below<uint32_t>(q, Rng(42).key(), f.start, 32, 64, f.range, kernel,
-                                            0, &end);
-            CHECK(std::memcmp(v.data(), f.out, sizeof f.out) == 0 &&
-                  end == tandem::align_pos(f.start, 32) + 64 * 32);
-            rejected += f.rejected;
-        }
-    for (const auto &f : CROSS_BELOW64_AT)
-        for (Kernel kernel : KERNELS) {
-            uint64_t end;
-            auto v = device_below<uint64_t>(q, Rng(42).key(), f.start, 32, 64, f.range, kernel,
-                                            0, &end);
-            CHECK(std::memcmp(v.data(), f.out, sizeof f.out) == 0 &&
-                  end == tandem::align_pos(f.start, 64) + 64 * 64);
-            rejected += f.rejected;
-        }
-    CHECK(rejected > 0);
-
     check_below<uint32_t>(q, "u32");
     check_below<uint64_t>(q, "u64");
 
@@ -765,20 +713,6 @@ static void test_below(sycl::queue &q) {
     for (uint32_t v : got)
         same = same && v == r.urand(1000u);
     CHECK(same);
-
-    CHECK(words_equal(CROSS_FILL_KEY, Rng(42).key().w));
-    const Key k42 = Rng(42).key();
-    for (Kernel kernel : KERNELS) {
-        uint64_t end;
-        for (const auto &f : CROSS_BELOW32) {
-            auto v = device_below<uint32_t>(q, k42, 0, 32, 64, f.range, kernel, 0, &end);
-            CHECK(std::memcmp(v.data(), f.out, sizeof f.out) == 0 && end == 64 * 32);
-        }
-        for (const auto &f : CROSS_BELOW64) {
-            auto v = device_below<uint64_t>(q, k42, 0, 32, 64, f.range, kernel, 0, &end);
-            CHECK(std::memcmp(v.data(), f.out, sizeof f.out) == 0 && end == 64 * 64);
-        }
-    }
 }
 
 // ---- Float64 normal fills ------------------------------------------------------------------
@@ -910,43 +844,11 @@ static void check_normal64_octets(sycl::queue &q) {
         }
 }
 
-static uint64_t fnv1a(uint64_t h, const void *p, size_t n) {
-    const unsigned char *b = static_cast<const unsigned char *>(p);
-    for (size_t i = 0; i < n; i++)
-        h = (h ^ b[i]) * 0x100000001b3ull;
-    return h;
-}
-
-// The fixtures of tandem-cuda, whose last rows hold misses of every kind, and the hash of
-// tandem-c's tests/test_normal_bits.c: 10^6 normals from each of five starts, bit for bit.
 static void test_normal64(sycl::queue &q) {
     check_normal64(q);
     check_normal64_cut(q);
     check_normal64_overflow(q);
     check_normal64_octets(q);
-
-    const Key k42 = Rng(42).key();
-    for (Kernel kernel : KERNELS)
-        for (const auto &f : CROSS_NORMAL64) {
-            uint64_t end;
-            auto v = device_normal64(q, k42, f.pos, 32, f.n, kernel, 0, &end);
-            CHECK(std::memcmp(v.data(), f.out, f.n * sizeof(double)) == 0 &&
-                  end == tandem::align_pos(f.pos, 64) + 64 * f.n);
-        }
-
-    constexpr size_t n = 1000000;
-    Dev<double> d(q, n);
-    uint64_t h = 0xcbf29ce484222325ull;
-    for (uint64_t start : {0ull, 1ull, 77ull, 12345ull, 1ull << 30}) {
-        Rng r(2026, 7);
-        r.set_position(start);
-        tandem::fill_normal(q, d.p, n, r).wait();
-        auto v = d.host(n);
-        h = fnv1a(h, v.data(), n * sizeof(double));
-    }
-    CHECK(h == 0xa61cfa844c85f7c1ull);
-    if (h != 0xa61cfa844c85f7c1ull)
-        std::printf("  normal f64 hash %016llx\n", (unsigned long long)h);
 }
 
 // ---- Float32 normal fills ------------------------------------------------------------------
@@ -1011,8 +913,7 @@ static void check_normal_at(sycl::queue &q, const Trial &t, NormalKernel kernel)
 // The group kernel cuts the fill into units of four words from its first word S and writes
 // them in octets aligned to the output, so the starts cover S % 4 (the word in a block) and
 // S / 4 % 8 (the lane of the first block) in several combinations, with group and work group
-// boundaries and every K kind. Fixtures from tandem-cuda at positions that put the first pair
-// at an even and an odd draw, with an odd count.
+// boundaries and every K kind.
 static void test_normal32(sycl::queue &q) {
     for (const Trial &t : trials(42, 24))
         for (NormalKernel kernel : normal_kernels(q))
@@ -1024,17 +925,6 @@ static void test_normal32(sycl::queue &q) {
                 for (NormalKernel kernel : normal_kernels(q))
                     check_normal_at(q, Trial{key, K, pos, n, n % 2 ? 1u : 0u}, kernel);
 
-    const Key k42 = Rng(42).key();
-    for (NormalKernel kernel : normal_kernels(q))
-        for (const auto &f : CROSS_NORMAL32) {
-            uint64_t end;
-            auto v = device_normal(q, k42, f.pos, 32, f.n, 0, &end, kernel);
-            bool ok = true;
-            for (unsigned i = 0; i < f.n; i++)
-                ok = ok && near_normal(v[i], f.out[i]);
-            CHECK(ok);
-            CHECK(end == tandem::align_pos(f.pos, 32) + 64 * ((f.n + 1) / 2));
-        }
 }
 
 // ---- Exponential fills ---------------------------------------------------------------------
@@ -1059,7 +949,7 @@ template <class E> static E host_exponential(Rng &r) {
 }
 
 // Both kernels equal the host's exponential() calls bit for bit at random keys, chunk lengths,
-// positions, lengths and alignments, and a fill cut at an element boundary equals the whole.
+// positions, lengths and alignments.
 template <class E> static void check_exponential(sycl::queue &q, const char *label) {
     for (const Trial &t : trials(271, 12)) {
         Rng r = Rng::from_key(t.key, t.pos, t.K);
@@ -1076,18 +966,6 @@ template <class E> static void check_exponential(sycl::queue &q, const char *lab
                             name(kernel), t.K, (unsigned long long)t.pos, t.n, t.shift);
         }
     }
-    const Key key = Rng(5, 6).key();
-    for (uint64_t start : {1ull, 12345ull})
-        for (size_t cut : {1, 7, 299})
-            for (Kernel kernel : KERNELS) {
-                uint64_t end_whole, end_a, end_b;
-                auto whole = device_exponential<E>(q, key, start, 32, 300, kernel, 0, &end_whole);
-                auto a = device_exponential<E>(q, key, start, 32, cut, kernel, 0, &end_a);
-                auto b = device_exponential<E>(q, key, end_a, 32, 300 - cut, kernel, 0, &end_b);
-                a.insert(a.end(), b.begin(), b.end());
-                CHECK(std::memcmp(whole.data(), a.data(), 300 * sizeof(E)) == 0 &&
-                      end_whole == end_b);
-            }
 }
 
 // Moments to the fourth order and a Kolmogorov-Smirnov statistic of the Exp(1) law on 10^7
@@ -1123,46 +1001,11 @@ template <class E> static void check_exp1(sycl::queue &q, const char *label) {
     CHECK(dmax * std::sqrt((double)n) < 1.95);
 }
 
-// The fixtures of tandem-cuda and the hash of tandem-c's tests/test_exponential_bits.c: 10^6
-// f64 then 10^6 f32 exponentials from each start, bit for bit.
 static void test_exponential(sycl::queue &q) {
     check_exponential<double>(q, "f64");
     check_exponential<float>(q, "f32");
     check_exp1<double>(q, "f64");
     check_exp1<float>(q, "f32");
-
-    const Key k42 = Rng(42).key();
-    for (Kernel kernel : KERNELS) {
-        for (const auto &f : CROSS_EXP64) {
-            uint64_t end;
-            auto v = device_exponential<double>(q, k42, f.pos, 32, f.n, kernel, 0, &end);
-            CHECK(std::memcmp(v.data(), f.out, f.n * sizeof(double)) == 0 &&
-                  end == tandem::align_pos(f.pos, 64) + 64 * f.n);
-        }
-        for (const auto &f : CROSS_EXP32) {
-            uint64_t end;
-            auto v = device_exponential<float>(q, k42, f.pos, 32, f.n, kernel, 0, &end);
-            CHECK(std::memcmp(v.data(), f.out, f.n * sizeof(float)) == 0 &&
-                  end == tandem::align_pos(f.pos, 32) + 32 * f.n);
-        }
-    }
-
-    constexpr size_t n = 1000000;
-    Dev<double> d(q, n);
-    Dev<float> f(q, n);
-    uint64_t h = 0xcbf29ce484222325ull;
-    for (uint64_t start : {0ull, 1ull, 77ull, 12345ull, 1ull << 30}) {
-        Rng r(2026, 7);
-        r.set_position(start);
-        tandem::fill_exponential(q, d.p, n, r);
-        tandem::fill_exponential(q, f.p, n, r).wait();
-        auto vd = d.host(n);
-        auto vf = f.host(n);
-        h = fnv1a(fnv1a(h, vd.data(), n * sizeof(double)), vf.data(), n * sizeof(float));
-    }
-    CHECK(h == 0x47f8f98297d94ee2ull);
-    if (h != 0x47f8f98297d94ee2ull)
-        std::printf("  exponential hash %016llx\n", (unsigned long long)h);
 }
 
 // Positions after a fill follow tandem-cuda: an empty fill of a type or of double normals aligns
@@ -1198,23 +1041,400 @@ static void test_positions(sycl::queue &q) {
         tandem::fill_normal(q, reinterpret_cast<float *>(d.p), 1, r).wait();
         CHECK(r.position() == tandem::align_pos(pos, 32) + 64);
     }
-    // A fill that would run past position 2^64 throws before it moves the position.
-    Rng r = Rng::from_key(key, ~0ull - 100, 32);
+}
+
+// ---- Conformance cases of the specification ------------------------------------------------
+
+// One case of below.json, fill_below.json, normal.json or exponential.json.
+struct Case {
+    std::string id, kind;
+    Key key;
+    uint32_t K;
+    unsigned w; // draw width
+    uint64_t start, n, end, range = 0;
+    std::vector<uint64_t> values;
+    double ulps = 0, abs = 0; // the tolerance of Float32 normals, 0 for bit equality
+    unsigned rejected = 0;
+};
+
+static std::vector<Case> read_cases(const std::string &dir, const char *file) {
+    const Json cases = read_json(dir + "/" + file);
+    std::vector<Case> out;
+    for (const Json &j : cases["cases"].items) {
+        Case c;
+        c.id = j["id"].text;
+        c.kind = j["kind"].text;
+        c.key = json_key(j["key"]);
+        c.K = (uint32_t)j["K"].u64();
+        c.w = c.kind.ends_with("32") ? 32 : 64;
+        c.start = j["start"].u64();
+        c.n = j["n"].u64();
+        if (const Json *r = j.find("range"))
+            c.range = r->hex();
+        for (const Json &v : j["values"].items)
+            c.values.push_back(v.hex());
+        if (const Json *t = j.find("tol")) {
+            c.ulps = (*t)["ulps"].number();
+            c.abs = (*t)["abs"].number();
+        }
+        if (const Json *r = j.find("rejected"))
+            c.rejected = (unsigned)r->u64();
+        // Where the source pins no end: one draw per element, a pair per two Float32 normals.
+        const uint64_t p0 = tandem::align_pos(c.start, c.w);
+        if (const Json *e = j.find("end"))
+            c.end = e->u64();
+        else
+            c.end = c.kind == "fill_normal_f32" ? p0 + 64 * ((c.n + 1) / 2) : p0 + c.w * c.n;
+        out.push_back(c);
+    }
+    return out;
+}
+
+static const Case &case_named(const std::vector<Case> &cases, const std::string &name) {
+    for (const Case &c : cases)
+        if (c.id.ends_with(" " + name))
+            return c;
+    throw std::runtime_error("no conformance case " + name);
+}
+
+// Bit for bit, or for Float32 normals |y - x| <= ulps 2^-23 |x| + abs.
+static bool matches(const Case &c, const std::vector<uint64_t> &got) {
+    if (got.size() != c.values.size())
+        return false;
+    for (size_t i = 0; i < got.size(); i++) {
+        if (c.ulps == 0) {
+            if (got[i] != c.values[i])
+                return false;
+            continue;
+        }
+        double y = sycl::bit_cast<float>((uint32_t)got[i]);
+        double x = sycl::bit_cast<float>((uint32_t)c.values[i]);
+        if (!(std::abs(y - x) <= c.ulps * 0x1p-23 * std::abs(x) + c.abs))
+            return false;
+    }
+    return true;
+}
+
+static std::vector<NormalKernel> case_paths(sycl::queue &q, const Case &c) {
+    if (c.kind == "fill_normal_f32")
+        return normal_kernels(q);
+    return {{Kernel::Chunk, Exchange::Auto, "chunk"}, {Kernel::Tile, Exchange::Auto, "tile"}};
+}
+
+// n elements of the case's fill from r on the device by one kernel path, as bit patterns. An
+// empty fill goes through the public API onto a sentinel, which it must leave alone.
+static std::vector<uint64_t> fill_case(sycl::queue &q, const Case &c, Rng &r, uint64_t n,
+                                       const NormalKernel &path) {
+    namespace td = tandem::detail;
+    Dev<uint64_t> d(q, n + 1);
+    auto *u32 = reinterpret_cast<uint32_t *>(d.p);
+    auto *f32 = reinterpret_cast<float *>(d.p);
+    auto *f64 = reinterpret_cast<double *>(d.p);
+    const std::string &k = c.kind;
+    if (n == 0) {
+        q.fill(d.p, ~0ull, 1).wait();
+        if (k == "fill_below_u32")
+            tandem::fill_below(q, u32, 0, r, (uint32_t)c.range).wait();
+        else if (k == "fill_below_u64")
+            tandem::fill_below(q, d.p, 0, r, c.range).wait();
+        else if (k == "fill_normal_f64")
+            tandem::fill_normal(q, f64, 0, r).wait();
+        else if (k == "fill_normal_f32")
+            tandem::fill_normal(q, f32, 0, r).wait();
+        else if (k == "fill_exponential_f64")
+            tandem::fill_exponential(q, f64, 0, r).wait();
+        else if (k == "fill_exponential_f32")
+            tandem::fill_exponential(q, f32, 0, r).wait();
+        CHECK(d.host(1)[0] == ~0ull);
+        return {};
+    }
+    if (k == "fill_below_u32")
+        td::fill_kind<td::below32>(q, td::UsmOut<uint32_t>{u32}, n, r, path.kernel, {}, c.range)
+            .wait();
+    else if (k == "fill_below_u64")
+        td::fill_kind<td::below64>(q, td::UsmOut<uint64_t>{d.p}, n, r, path.kernel, {}, c.range)
+            .wait();
+    else if (k == "fill_normal_f64")
+        td::fill_normal_kind<double>(q, td::UsmOut<double>{f64}, n, r, {}, path.kernel).wait();
+    else if (k == "fill_normal_f32")
+        td::fill_normal_f32_kind(q, td::UsmOut<float>{f32}, n, r, {}, path.kernel, path.exchange)
+            .wait();
+    else if (k == "fill_exponential_f64")
+        td::fill_kind<td::exp64>(q, td::UsmOut<double>{f64}, n, r, path.kernel, {}).wait();
+    else if (k == "fill_exponential_f32")
+        td::fill_kind<td::exp32>(q, td::UsmOut<float>{f32}, n, r, path.kernel, {}).wait();
+    if (c.w == 64)
+        return d.host(n);
+    std::vector<uint32_t> h(n);
+    q.memcpy(h.data(), u32, 4 * n).wait();
+    return std::vector<uint64_t>(h.begin(), h.end());
+}
+
+// Every case on every kernel path: whole, and cut at elements 1, 7, 20, 21 and n - 1 into
+// pieces filled in order on one generator, values and end position. A Float32 normal fill cuts
+// only between pairs, since an odd piece drops its last sin half. The cases hold the fallbacks
+// by global draw index, the empty fills, odd Float32 normal counts and the pair rule.
+static void check_fill_cases(sycl::queue &q, const std::vector<Case> &cases) {
+    for (const Case &c : cases)
+        for (const NormalKernel &path : case_paths(q, c)) {
+            Rng r = Rng::from_key(c.key, c.start, c.K);
+            bool ok = matches(c, fill_case(q, c, r, c.n, path)) && r.position() == c.end;
+            const uint64_t cuts[] = {1, 7, 20, 21, c.n - 1};
+            for (uint64_t cut : cuts) {
+                if (c.n == 0 || cut >= c.n || (c.kind == "fill_normal_f32" && cut % 2))
+                    continue;
+                Rng g = Rng::from_key(c.key, c.start, c.K);
+                auto a = fill_case(q, c, g, cut, path);
+                auto b = fill_case(q, c, g, c.n - cut, path);
+                a.insert(a.end(), b.begin(), b.end());
+                ok = ok && matches(c, a) && g.position() == c.end;
+            }
+            CHECK(ok);
+            if (!ok)
+                std::printf("  %s (%s) differs\n", c.id.c_str(), path.name);
+        }
+}
+
+// Element i of case a equals element i + shift of case b, both filled here.
+static void check_shift(sycl::queue &q, const std::vector<Case> &cases, const char *a,
+                        const char *b, size_t shift) {
+    const Case &ca = case_named(cases, a), &cb = case_named(cases, b);
+    const NormalKernel path = case_paths(q, ca)[0];
+    Rng ra = Rng::from_key(ca.key, ca.start, ca.K), rb = Rng::from_key(cb.key, cb.start, cb.K);
+    auto va = fill_case(q, ca, ra, ca.n, path), vb = fill_case(q, cb, rb, cb.n, path);
+    bool ok = !va.empty();
+    for (size_t i = 0; i < va.size() && i + shift < vb.size(); i++)
+        ok = ok && va[i] == vb[i + shift];
+    CHECK(ok);
+}
+
+enum class Scalar { below_u32, below_u64, normal_f64, normal_f32, exp_f64, exp_f32 };
+
+static uint64_t scalar_draw(Rng &r, Scalar s, uint64_t range) {
+    switch (s) {
+    case Scalar::below_u32:
+        return r.urand((uint32_t)range);
+    case Scalar::below_u64:
+        return r.urand64(range);
+    case Scalar::normal_f64:
+        return sycl::bit_cast<uint64_t>(r.normal());
+    case Scalar::normal_f32:
+        return sycl::bit_cast<uint32_t>(r.normalf());
+    case Scalar::exp_f64:
+        return sycl::bit_cast<uint64_t>(r.exponential());
+    default:
+        return sycl::bit_cast<uint32_t>(r.exponentialf());
+    }
+}
+
+// The first n values of a case as n scalar draws on the host and in a kernel, and the position
+// after them.
+static void check_scalars(sycl::queue &q, const Case &c, Scalar s, uint64_t n, uint64_t end) {
+    Case head = c;
+    head.values.resize(n);
+    Rng r = Rng::from_key(c.key, c.start, c.K);
+    std::vector<uint64_t> host(n);
+    for (uint64_t &v : host)
+        v = scalar_draw(r, s, c.range);
+    Dev<uint64_t> d(q, n + 1);
+    uint64_t *p = d.p;
+    const Key key = c.key;
+    const uint64_t start = c.start, range = c.range;
+    const uint32_t K = c.K;
+    q.single_task([=] {
+         Rng g = Rng::from_key(key, start, K);
+         for (uint64_t i = 0; i < n; i++)
+             p[i] = scalar_draw(g, s, range);
+         p[n] = g.position();
+     }).wait();
+    auto dev = d.host(n + 1);
+    const uint64_t dev_end = dev.back();
+    dev.pop_back();
+    bool ok = matches(head, host) && r.position() == end && matches(head, dev) && dev_end == end;
+    CHECK(ok);
+    if (!ok)
+        std::printf("  %s scalar draws differ\n", c.id.c_str());
+}
+
+// Range 0 gives 0 and consumes one draw of the width that the interface names.
+static void check_range0(sycl::queue &q) {
+    Dev<uint64_t> d(q, 1);
+    Rng r = Rng::from_key(Rng(42).key(), 33, 32);
+    q.fill(d.p, ~0ull, 1).wait();
+    tandem::fill_below(q, reinterpret_cast<uint32_t *>(d.p), 1, r, 0u).wait();
+    CHECK((uint32_t)d.host(1)[0] == 0 && r.position() == 96);
+    tandem::fill_below(q, d.p, 1, r, (uint64_t)0).wait();
+    CHECK(d.host(1)[0] == 0 && r.position() == 192);
+    CHECK(r.urand(0u) == 0 && r.position() == 224);
+    CHECK(r.urand64((uint64_t)0) == 0 && r.position() == 320);
+}
+
+static void test_cases(sycl::queue &q, const std::string &dir) {
+    const auto below = read_cases(dir, "below.json");
+    const auto fill_below = read_cases(dir, "fill_below.json");
+    const auto normal = read_cases(dir, "normal.json");
+    const auto exponential = read_cases(dir, "exponential.json");
+    check_fill_cases(q, fill_below);
+    check_fill_cases(q, normal);
+    check_fill_cases(q, exponential);
+    unsigned rejected = 0;
+    for (const Case &c : fill_below)
+        rejected += c.rejected;
+    CHECK(rejected > 0);
+
+    // Scalar bounded draws retry in sequence. Scalar normals and exponentials equal the fills.
+    for (const Case &c : below)
+        check_scalars(q, c, c.w == 32 ? Scalar::below_u32 : Scalar::below_u64, c.n, c.end);
+    for (const Case &c : normal)
+        if (c.kind == "fill_normal_f64" && c.n)
+            check_scalars(q, c, Scalar::normal_f64, c.n, c.end);
+    for (const Case &c : exponential)
+        if (c.n)
+            check_scalars(q, c, c.w == 64 ? Scalar::exp_f64 : Scalar::exp_f32, c.n, c.end);
+    // A scalar Float32 normal is the cos half of a pair and consumes two draws.
+    const Case &nf = case_named(normal, "CROSS_NORMALF");
+    check_scalars(q, nf, Scalar::normal_f32, 1, tandem::align_pos(nf.start, 32) + 64);
+
+    // A later start shifts the elements: the fallback follows the global draw index, and a
+    // Float32 normal start one pair later shifts the output by one pair.
+    check_shift(q, fill_below, "CROSS_BELOW32_AT[4]", "CROSS_BELOW32[4]", 1);
+    check_shift(q, fill_below, "CROSS_BELOW64_AT[6]", "CROSS_BELOW64[6]", 1);
+    check_shift(q, normal, "CROSS_NORMAL[1]", "CROSS_NORMAL[0]", 1);
+    check_shift(q, normal, "CROSS_NORMAL32[2]", "CROSS_NORMAL32[0]", 2);
+    check_shift(q, normal, "CROSS_NORMAL32[1]", "CROSS_NORMALF", 0);
+    check_range0(q);
+}
+
+// ---- Dumps of hashes.json and position boundaries ------------------------------------------
+
+static uint64_t fnv1a(uint64_t h, const void *p, size_t n) {
+    const unsigned char *b = static_cast<const unsigned char *>(p);
+    for (size_t i = 0; i < n; i++)
+        h = (h ^ b[i]) * 0x100000001b3ull;
+    return h;
+}
+
+// The fills of each dump in order on one generator per start. The Float32 normal hash holds
+// for C's polynomials, which the host's normalf2 takes and the fills' native cos and sin do not,
+// so that dump runs on the host.
+static void test_dumps(sycl::queue &q, const Json &hashes) {
+    for (const Json &dump : hashes["dumps"].items) {
+        const Key key = json_key(dump["key"]);
+        uint64_t h = 0xcbf29ce484222325ull, end = 0;
+        for (const Json &start : dump["starts"].items) {
+            Rng r = Rng::from_key(key, start.u64(), (uint32_t)dump["K"].u64());
+            for (const Json &draw : dump["draws"].items) {
+                const std::string &kind = draw["kind"].text;
+                const size_t n = draw["n"].u64();
+                if (kind == "fill_normal_f32") {
+                    std::vector<float> z = sequential_normals(r, n);
+                    h = fnv1a(h, z.data(), 4 * n);
+                    continue;
+                }
+                Dev<double> d(q, n);
+                size_t size = 8;
+                if (kind == "fill_normal_f64")
+                    tandem::fill_normal(q, d.p, n, r).wait();
+                else if (kind == "fill_exponential_f64")
+                    tandem::fill_exponential(q, d.p, n, r).wait();
+                else if (kind == "fill_exponential_f32")
+                    tandem::fill_exponential(q, reinterpret_cast<float *>(d.p), n, r).wait(),
+                        size = 4;
+                std::vector<uint8_t> bytes(n * size);
+                q.memcpy(bytes.data(), d.p, bytes.size()).wait();
+                h = fnv1a(h, bytes.data(), bytes.size());
+            }
+            end = r.position();
+        }
+        const Json *want_end = dump.find("end");
+        bool ok = h == dump["fnv1a"].hex() && (!want_end || end == want_end->u64());
+        CHECK(ok);
+        if (!ok)
+            std::printf("  %s: hash %016llx\n", dump["id"].text.c_str(), (unsigned long long)h);
+    }
+}
+
+// A complex value whose real part ends a block takes its imaginary part from the next block.
+static void check_complex_straddle(sycl::queue &q) {
+    const Key key = Rng(42).key();
+    const Rng at0 = Rng::from_key(key, 0, 32);
+    Dev<std::complex<double>> zd(q, 1);
+    Dev<std::complex<float>> zf(q, 1);
+    Rng r = Rng::from_key(key, 64, 32);
+    tandem::fill(q, zd.p, 1, r).wait();
+    CHECK(r.position() == 192);
+    r.set_position(96);
+    tandem::fill(q, zf.p, 1, r).wait();
+    CHECK(r.position() == 160);
+    auto d = zd.host(1);
+    auto f = zf.host(1);
+    CHECK(d[0].real() == at0.at_drand(1) && d[0].imag() == at0.at_drand(2));
+    CHECK(f[0].real() == at0.at_frand(3) && f[0].imag() == at0.at_frand(4));
+}
+
+// Random access on the host and in a kernel equals the fill from the same position, from starts
+// on both sides of block, row and chunk boundaries. A chunk at K = 8 is 8192 bits.
+static void check_random_access(sycl::queue &q) {
+    const Key key = Rng(42).key();
+    constexpr size_t n = 64;
+    for (uint64_t p : {0ull, 100ull, 127ull, 128ull, 1000ull, 1023ull, 1024ull, 6000ull, 8191ull,
+                       8192ull, 8193ull, 16389ull}) {
+        auto u64 = device_fill<uint64_t>(q, key, p, 8, n, Kernel::Chunk);
+        auto u32 = device_fill<uint32_t>(q, key, p, 8, n, Kernel::Chunk);
+        Dev<uint64_t> d(q, 2 * n);
+        uint64_t *v = d.p;
+        q.single_task([=] {
+             const Rng r = Rng::from_key(key, p, 8);
+             for (size_t i = 0; i < n; i++) {
+                 v[i] = r.at_urand64(i);
+                 v[n + i] = r.at_urand(i);
+             }
+         }).wait();
+        auto dev = d.host(2 * n);
+        const Rng r = Rng::from_key(key, p, 8);
+        bool ok = true;
+        for (size_t i = 0; i < n; i++)
+            ok = ok && r.at_urand64(i) == u64[i] && dev[i] == u64[i] && r.at_urand(i) == u32[i] &&
+                 dev[n + i] == u32[i];
+        CHECK(ok);
+    }
+}
+
+// A UInt64 draw at 2^63 - 1 aligns to 2^63, on the host and in a fill. A fill whose end reaches
+// 2^64 throws before it writes or moves the position, and one that ends just below runs.
+static void check_position_bounds(sycl::queue &q) {
+    const Key key = Rng(42).key();
+    const uint64_t top = 1ull << 63;
+    Rng r = Rng::from_key(key, top - 1, 32);
+    const uint64_t x = r.urand64();
+    CHECK(r.position() == top + 64 && x == Rng::from_key(key, top, 32).at_urand64(0));
+    uint64_t end;
+    auto v = device_fill<uint64_t>(q, key, top - 1, 32, 1, Kernel::Auto, 0, &end);
+    CHECK(v[0] == x && end == top + 64);
+
+    Dev<uint64_t> d(q, 4);
+    q.fill(d.p, ~0ull, 4).wait();
+    Rng g = Rng::from_key(key, ~0ull - 255, 32);
     bool threw = false;
     try {
-        tandem::fill(q, d.p, 4, r);
+        tandem::fill(q, d.p, 4, g);
     } catch (const std::overflow_error &) {
         threw = true;
     }
-    CHECK(threw && r.position() == ~0ull - 100);
+    auto h = d.host(4);
+    CHECK(threw && g.position() == ~0ull - 255 &&
+          std::all_of(h.begin(), h.end(), [](uint64_t y) { return y == ~0ull; }));
+    tandem::fill(q, d.p, 3, g).wait();
+    CHECK(g.position() == ~0ull - 63);
 }
 
 int main(int argc, char **argv) {
-    std::string dir = argc > 1 ? argv[argc - 1] : "tests/data";
+    const std::string dir = argc > 1 ? argv[argc - 1] : "tests/conformance";
+    const Json hashes = read_json(dir + "/hashes.json");
     sycl::queue q;
     std::printf("device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
     test_vectors(q);
-    test_dumps(q, dir);
+    test_streams(q, hashes);
     check_against_draws<uint32_t>(q, "u32");
     check_against_draws<uint64_t>(q, "u64");
     check_against_draws<float>(q, "f32");
@@ -1243,6 +1463,11 @@ int main(int argc, char **argv) {
     test_normal32(q);
     test_exponential(q);
     test_positions(q);
+    test_cases(q, dir);
+    test_dumps(q, hashes);
+    check_complex_straddle(q);
+    check_random_access(q);
+    check_position_bounds(q);
     if (failures) {
         std::printf("%ld of %ld checks failed\n", failures, checks);
         return 1;

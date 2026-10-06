@@ -52,12 +52,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: |
-          git clone -q --depth 1 https://github.com/tandem-rng/spec ../tandem-spec
+          git clone -q https://github.com/tandem-rng/spec ../tandem-spec
           python3 tools/gen_vectors.py ../tandem-spec/vectors.json > tests/vectors.hpp
           git diff --exit-code tests/vectors.hpp
+      # The copies of the conformance files equal the spec's at the pinned commit, file for file.
       - run: |
-          git clone -q --depth 1 https://github.com/tandem-rng/tandem-cuda ../tandem-cuda
-          for f in tests/data/*.bin; do cmp "$f" "../tandem-cuda/$f"; done
+          pin=f4205457e1e2ed19e655e36820015d7bdcf037dd
+          diff <(git -C ../tandem-spec ls-tree --name-only $pin conformance/ | grep '\.json$') \
+               <(ls tests/conformance/*.json | sed 's|^tests/||')
+          for f in tests/conformance/*.json; do
+            git -C ../tandem-spec show "$pin:${f#tests/}" | cmp - "$f"
+          done
   pin:
     name: tandem-cuda pin is on its main
     runs-on: ubuntu-latest

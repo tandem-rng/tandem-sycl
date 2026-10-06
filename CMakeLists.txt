@@ -51,7 +51,7 @@ if(TANDEM_TESTS)
     add_executable(test_tandem tests/test_tandem.cpp)
     target_link_libraries(test_tandem PRIVATE tandem::sycl)
     tandem_add_sycl(test_tandem)
-    add_test(NAME tandem COMMAND test_tandem ${CMAKE_CURRENT_SOURCE_DIR}/tests/data)
+    add_test(NAME tandem COMMAND test_tandem ${CMAKE_CURRENT_SOURCE_DIR}/tests/conformance)
 endif()
 
 if(TANDEM_BENCH)

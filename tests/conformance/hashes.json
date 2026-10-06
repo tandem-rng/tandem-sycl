@@ -1,0 +1,24 @@
+{
+  "source": ["tandem-c 1adf2aca3926c96c3f22ea03c4a5cf2bdbb65acc tests/data, tools/dump_*.c, tests/test_*_bits.c"],
+  "streams": [
+    {"file": "tests/data/k1234_K32_u32.bin", "key": ["00000001", "00000002", "00000003", "00000004"], "K": 32, "start": 0, "type": "UInt32", "n": 65536, "bytes": 262144, "sha256": "7151604c41d53021ba562d55dfaf9433ee8453bb66dc4f23f7e1c249a007d37e"},
+    {"file": "tests/data/k1234_K32_u64.bin", "key": ["00000001", "00000002", "00000003", "00000004"], "K": 32, "start": 0, "type": "UInt64", "n": 2048, "bytes": 16384, "sha256": "c54744f6bda13e1bbe66e2fe61a15b1c514c402435df8b9ceee6e31d45e0766f"},
+    {"file": "tests/data/k1234_K8_u32.bin", "key": ["00000001", "00000002", "00000003", "00000004"], "K": 8, "start": 0, "type": "UInt32", "n": 16384, "bytes": 65536, "sha256": "0dc104ffb2223bf685ce37eb7ae6669a90a2b61db8700ce143adfe43da8bdb0d"},
+    {"file": "tests/data/seed42_K32_f64.bin", "key": ["421d21eb", "32d31777", "62e7564b", "df2bdf82"], "K": 32, "start": 0, "type": "Float64", "n": 4096, "bytes": 32768, "sha256": "f50e8456cc6a18978e8d2b264fff7322b33bee051ea7e031a70de95ad249f036"},
+    {"file": "tests/data/seed42_K32_f32.bin", "key": ["421d21eb", "32d31777", "62e7564b", "df2bdf82"], "K": 32, "start": 0, "type": "Float32", "n": 4096, "bytes": 16384, "sha256": "e9fbe45e86da732c9eefd861742362de1f34e0eab59059c0a2e8029c7c3f40d2"},
+    {"file": "tests/data/seed42_K32_u8.bin", "key": ["421d21eb", "32d31777", "62e7564b", "df2bdf82"], "K": 32, "start": 0, "type": "UInt8", "n": 8192, "bytes": 8192, "sha256": "a1dabf4458c670b25b0212dce74937f3e89ffa0a46757480e2e54818ec0a0849"},
+    {"file": "tests/data/seed42_K32_bool.bin", "key": ["421d21eb", "32d31777", "62e7564b", "df2bdf82"], "K": 32, "start": 0, "type": "Bool", "n": 4096, "bytes": 4096, "sha256": "fb2680a5058750b8888d8d739aa3c2fe6fce4ef22d5ab523152415de1536a665"},
+    {"file": "tests/data/seed42_K32_u128.bin", "key": ["421d21eb", "32d31777", "62e7564b", "df2bdf82"], "K": 32, "start": 0, "type": "UInt128", "n": 1024, "bytes": 16384, "sha256": "1aacdbd217acca7dad8ca7138e4dfa804a2a31b0ceea5ce9af9f6ace00283d22"},
+    {"file": "tests/data/seed42_K32_c64.bin", "key": ["421d21eb", "32d31777", "62e7564b", "df2bdf82"], "K": 32, "start": 0, "type": "ComplexF64", "n": 1024, "bytes": 16384, "sha256": "ba97e831f962c10baf3e34144e6c2e1c942b21ec940ce1c377268b7b21fbc6ff"},
+    {"file": "tests/data/seed42_K32_c32.bin", "key": ["421d21eb", "32d31777", "62e7564b", "df2bdf82"], "K": 32, "start": 0, "type": "ComplexF32", "n": 1024, "bytes": 8192, "sha256": "5b5a3a737146bcf89893eb122dfc1d0baf1ed9dc8b3aaf05d502542b0e3155f1"},
+    {"file": "tests/data/seed42_K32_f16bits.bin", "key": ["421d21eb", "32d31777", "62e7564b", "df2bdf82"], "K": 32, "start": 0, "type": "Float16", "n": 4096, "bytes": 8192, "sha256": "90f511a71094781a22e7190f6ce8073b33f0a51951f748f3a82049efcaadb71e"},
+    {"file": "tests/data/seed42_K32_char.bin", "key": ["421d21eb", "32d31777", "62e7564b", "df2bdf82"], "K": 32, "start": 0, "type": "Char", "n": 4096, "bytes": 16384, "sha256": "1d2f84645912884d6847e19f1579bfa8c58bfc28e420d1e4d85efa9d088da134"}
+  ],
+  "dumps": [
+    {"id": "tools/dump_normals.c", "seed": "000000000000000700000000000007ea", "key": ["2e25d570", "16aed62b", "3ecbb2c7", "0c03725c"], "K": 32, "starts": [0, 1, 77, 12345, 1073741824], "draws": [{"kind": "fill_normal_f64", "n": 1000000}], "bytes": 40000000, "sha256": "700ec4d2f4d6b82aaa56c6eff18a4e5919585fdbd093988773383d580ea610d1", "fnv1a": "a61cfa844c85f7c1"},
+    {"id": "tools/dump_exponentials.c", "seed": "000000000000000700000000000007ea", "key": ["2e25d570", "16aed62b", "3ecbb2c7", "0c03725c"], "K": 32, "starts": [0, 1, 77, 12345, 1073741824], "draws": [{"kind": "fill_exponential_f64", "n": 1000000}, {"kind": "fill_exponential_f32", "n": 1000000}], "bytes": 60000000, "sha256": "5c035a4ef1368231d25a9c2f9201be2df3224e28a14549a50625d0db3770ef4e", "fnv1a": "47f8f98297d94ee2"},
+    {"id": "tests/test_normal_bits.c normal f32", "seed": "000000000000000700000000000007ea", "key": ["2e25d570", "16aed62b", "3ecbb2c7", "0c03725c"], "K": 32, "starts": [0, 1, 77, 12345, 1073741824], "draws": [{"kind": "fill_normal_f32", "n": 1999999}], "bytes": 39999980, "fnv1a": "aa1ea656ce73a4fb"},
+    {"id": "tests/test_normal_bits.c Python reference", "key": ["00000001", "00000002", "00000003", "00000004"], "K": 32, "starts": [0], "draws": [{"kind": "fill_normal_f64", "n": 200000}], "bytes": 1600000, "fnv1a": "0c4059ed409d578d", "end": 12800000},
+    {"id": "tests/test_normal_bits.c Python reference", "key": ["00000001", "00000002", "00000003", "00000004"], "K": 32, "starts": [2373], "draws": [{"kind": "fill_normal_f64", "n": 200000}], "bytes": 1600000, "fnv1a": "30ce40c86b295193", "end": 12802432}
+  ]
+}
