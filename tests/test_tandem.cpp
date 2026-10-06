@@ -1220,16 +1220,20 @@ static std::vector<uint64_t> fill_case(sycl::queue &q, const Case &c, Rng &r, ui
 
 // Every case on every kernel path: whole, and cut at elements 1, 7, 20, 21 and n - 1 into
 // pieces filled in order on one generator, values and end position. A Float32 normal fill cuts
-// only between pairs, since an odd piece drops its last sin half. The cases hold the fallbacks
+// only between pairs, at 2, 8, 20 and the largest even element below n, since an odd piece
+// drops its last sin half (tandem-spec b31af72). The cases hold the fallbacks
 // by global draw index, the empty fills, odd Float32 normal counts and the pair rule.
 static void check_fill_cases(sycl::queue &q, const std::vector<Case> &cases) {
     for (const Case &c : cases)
         for (const NormalKernel &path : case_paths(q, c)) {
             Rng r = Rng::from_key(c.key, c.start, c.K);
             bool ok = matches(c, fill_case(q, c, r, c.n, path)) && r.position() == c.end;
-            const uint64_t cuts[] = {1, 7, 20, 21, c.n - 1};
+            const bool pairs = c.kind == "fill_normal_f32";
+            const std::vector<uint64_t> cuts =
+                pairs ? std::vector<uint64_t>{2, 8, 20, (c.n - 1) & ~1ull}
+                      : std::vector<uint64_t>{1, 7, 20, 21, c.n - 1};
             for (uint64_t cut : cuts) {
-                if (c.n == 0 || cut >= c.n || (c.kind == "fill_normal_f32" && cut % 2))
+                if (c.n == 0 || cut == 0 || cut >= c.n)
                     continue;
                 Rng g = Rng::from_key(c.key, c.start, c.K);
                 auto a = fill_case(q, c, g, cut, path);
