@@ -8,8 +8,8 @@ pixi run -e cuda test-cuda            # AdaptiveCpp 25.10 for CUDA 12.9, Linux w
 
 ## Suite
 
-`tests/test_tandem.cpp` runs every check on the default SYCL device: 3363 checks on the
-AdaptiveCpp CPU device, 3939 on the A100, which also runs the normal fills' shuffle
+`tests/test_tandem.cpp` runs every check on the default SYCL device: 3366 checks on the
+AdaptiveCpp CPU device, 3942 on the A100, which also runs the normal fills' shuffle
 variant. It
 checks every vector of the specification and every case of its conformance files (see
 below), hashes fills with both kernels and in-kernel scalar draws against the stream SHA-256

@@ -104,7 +104,7 @@ stream position 2^64 throws `std::overflow_error` before it moves the position.
 | `exponential()`, `exponentialf()` | `-log(1 - u)` of one Float64 or Float32 draw |
 | `choice(table)` | the weighted choice of one UInt64 draw, element 0 of a choice fill |
 | `split(i)`, `sub(purpose)`, `fork(children, n)` | child generators as the specification defines them |
-| `key()`, `position()`, `set_position(p)`, `chunk_length()` | transport form |
+| `key()`, `position()`, `set_position(p)`, `chunk_length()` | transport form; `set_position` returns false and changes nothing for `p` at or above 2^63 |
 
 Signed integers hold the two's complement of the unsigned draw of the same width. A complex
 value takes two draws, the real and then the imaginary component.
