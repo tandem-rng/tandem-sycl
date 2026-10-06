@@ -36,17 +36,20 @@ struct below64 {};
 struct exp32 {}; /* -log(1 - u) of the f32 draws, spec Appendix A */
 struct exp64 {};
 struct normal64 {}; /* the ziggurat of the u64 draws, see PURPOSE_NORMAL64 */
+struct choice_idx {}; /* weighted choice indices of the u64 draws, spec Appendix C */
 
 /* The fill's geometry: stream bits [p0, p1), rows r0 .. r1 inclusive, groups g0 .. g1, and
- * what the bounded kinds and the f64 normals need: the fill's key and chunk length, the range
- * and its rejection threshold, and the ziggurat's layers, which a kernel points to its copy in
- * local memory. The float normal fill keeps its element count in `range`. */
+ * what the bounded kinds, the f64 normals and the choice need: the fill's key and chunk length,
+ * the range and its rejection threshold, the ziggurat's layers, which a kernel points to its
+ * copy in local memory, and the alias table. The float normal fill keeps its element count in
+ * `range`. */
 struct Span {
     uint64_t p0, p1, r0, r1, g0, g1;
     uint32_t K;
     Key key;
     uint64_t range, thresh;
     const zig::Layer *wk;
+    ChoiceTable table;
 };
 
 /* How an output element is made from a block: element k of the block takes bits
@@ -123,6 +126,13 @@ template <> struct elem<normal64> {
         return w[2 * k] | ((uint64_t)w[2 * k + 1] << 32);
     }
 };
+template <> struct elem<choice_idx> {
+    using out_t = uint32_t;
+    static constexpr unsigned bits = 64;
+    static uint64_t draw(const uint32_t w[4], unsigned k) {
+        return w[2 * k] | ((uint64_t)w[2 * k + 1] << 32);
+    }
+};
 template <> struct elem<below32> {
     using out_t = uint32_t;
     static constexpr unsigned bits = 32;
@@ -140,11 +150,17 @@ struct alignas(16) Block {
     uint32_t w[4];
 };
 
-/* Whether every block of the fill lands on a 16-byte address: the output's first byte and the
- * fill's first stream byte (bit, for bool) agree modulo 16. */
+/* The output bytes of one block: 16, or 8 for the choice's u32 indices of u64 draws. A bool
+ * block, 128 bytes, leaves in 16-byte parts. */
+template <class Kind>
+constexpr unsigned block_bytes =
+    std::is_same_v<Kind, bool> ? 16 : 128 / elem<Kind>::bits * sizeof(typename elem<Kind>::out_t);
+
+/* Whether every block of the fill lands on an address aligned to its output bytes: the output's
+ * first byte and the output offset of the fill's first stream bit agree modulo block_bytes. */
 template <class Kind> bool blocks_aligned(const typename elem<Kind>::out_t *out, const Span &s) {
-    uint64_t first = std::is_same_v<Kind, bool> ? s.p0 : s.p0 / 8;
-    return ((reinterpret_cast<uintptr_t>(out) - first) & 15u) == 0;
+    uint64_t first = s.p0 / elem<Kind>::bits * sizeof(typename elem<Kind>::out_t);
+    return ((reinterpret_cast<uintptr_t>(out) - first) & (block_bytes<Kind> - 1u)) == 0;
 }
 
 /* An N-byte store, N = 8 or 16, to an N-byte aligned address. NVPTX receives a copy of a
@@ -242,6 +258,9 @@ inline void block_values(const uint32_t w[4], uint64_t P, const Span &s,
                 if (j == k)
                     x[j] = v;
         }
+    } else if constexpr (std::is_same_v<Kind, choice_idx>) {
+        for (unsigned k = 0; k < per_block; k++)
+            x[k] = choice_of(s.table, elem<Kind>::draw(w, k));
     } else {
         for (unsigned k = 0; k < per_block; k++)
             x[k] = elem<Kind>::make(w, k);
@@ -249,8 +268,8 @@ inline void block_values(const uint32_t w[4], uint64_t P, const Span &s,
 }
 
 /* Store the elements of the block at stream bit P that fall inside the fill's bits [p0, p1).
- * With ALIGNED a block fully inside leaves as 16-byte stores: one, or eight for bool, whose
- * 128 elements are one byte each. */
+ * With ALIGNED a block fully inside leaves as one store of block_bytes, or eight 16-byte stores
+ * for bool, whose 128 elements are one byte each. */
 template <class Kind, bool ALIGNED>
 inline void store_block(typename elem<Kind>::out_t *out, const Span &s, uint64_t P,
                         const uint32_t w[4]) {
@@ -263,7 +282,7 @@ inline void store_block(typename elem<Kind>::out_t *out, const Span &s, uint64_t
         O x[per_block];
         block_values<Kind>(w, P, s, x);
         if (ALIGNED && P >= s.p0 && P + 128u <= s.p1) {
-            store_wide<16>(out + (P - s.p0) / bits, x);
+            store_wide<block_bytes<Kind>>(out + (P - s.p0) / bits, x);
             return;
         }
         for (unsigned k = 0; k < per_block; k++) {
@@ -822,6 +841,7 @@ inline bool plan_span(Rng &rng, uint64_t n, unsigned align, unsigned bits, Span 
     s.p1 = p0 + n * bits;
     s.range = s.thresh = 0;
     s.wk = nullptr; /* set by with_layers inside the kernel */
+    s.table = ChoiceTable{};
     rng.set_position(s.p1);
     return n != 0;
 }
@@ -836,12 +856,14 @@ inline void set_rows(Span &s, uint64_t ba, uint64_t bb) {
 
 template <class Kind, class Out>
 sycl::event fill_kind(sycl::queue &q, const Out &out, uint64_t n, Rng &rng, Kernel kernel,
-                      const std::vector<sycl::event> &deps, uint64_t range = 0) {
+                      const std::vector<sycl::event> &deps, uint64_t range = 0,
+                      const ChoiceTable &table = {}) {
     constexpr unsigned bits = elem<Kind>::bits;
     Span s;
     if (!plan_span(rng, n, bits, bits, s))
         return sycl::event();
     s.range = range;
+    s.table = table;
     if constexpr (std::is_same_v<Kind, below32>)
         s.thresh = below_threshold_u32((uint32_t)range);
     else if constexpr (std::is_same_v<Kind, below64>)
@@ -1361,6 +1383,26 @@ sycl::event fill_exponential(sycl::queue &q, sycl::buffer<E, D> &buf, Rng &rng) 
         return sycl::event();
     return detail::fill_kind<typename detail::exponential<E>::kind>(
         q, detail::BufOut<E, E, D>{buf}, buf.size(), rng, detail::Kernel::Auto, {});
+}
+
+/* Weighted choice indices, Appendix C of the specification: element i maps UInt64 draw i of the
+ * fill through the alias table, so the fill consumes 64 bits per element, never retries, equals
+ * the Rng::choice calls and is bit identical to tandem-c's tandem_fill_choice. Build the table
+ * with choice_build on the host, then copy its cut and alias arrays to USM memory that the
+ * queue's device reads, and view them with a ChoiceTable. An empty fill aligns the position to
+ * 64 bits. */
+inline sycl::event fill_choice(sycl::queue &q, uint32_t *out, size_t n, Rng &rng,
+                               const ChoiceTable &table,
+                               const std::vector<sycl::event> &deps = {}) {
+    return detail::fill_kind<detail::choice_idx>(q, detail::UsmOut<uint32_t>{out}, n, rng,
+                                                 detail::Kernel::Auto, deps, 0, table);
+}
+template <int D>
+sycl::event fill_choice(sycl::queue &q, sycl::buffer<uint32_t, D> &buf, Rng &rng,
+                        const ChoiceTable &table) {
+    return detail::fill_kind<detail::choice_idx>(q, detail::BufOut<uint32_t, uint32_t, D>{buf},
+                                                 buf.size(), rng, detail::Kernel::Auto, {}, 0,
+                                                 table);
 }
 
 } // namespace tandem

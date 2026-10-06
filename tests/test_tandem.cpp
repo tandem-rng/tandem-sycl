@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstring>
 
+#include <limits>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -1045,7 +1047,7 @@ static void test_positions(sycl::queue &q) {
 
 // ---- Conformance cases of the specification ------------------------------------------------
 
-// One case of below.json, fill_below.json, normal.json or exponential.json.
+// One case of below.json, fill_below.json, normal.json, exponential.json or choice.json.
 struct Case {
     std::string id, kind;
     Key key;
@@ -1055,6 +1057,9 @@ struct Case {
     std::vector<uint64_t> values;
     double ulps = 0, abs = 0; // the tolerance of Float32 normals, 0 for bit equality
     unsigned rejected = 0;
+    std::vector<double> weights;
+    uint64_t capacity = 0;
+    std::vector<uint64_t> cut, alias; // where the case pins the whole table
 };
 
 static std::vector<Case> read_cases(const std::string &dir, const char *file) {
@@ -1079,6 +1084,17 @@ static std::vector<Case> read_cases(const std::string &dir, const char *file) {
         }
         if (const Json *r = j.find("rejected"))
             c.rejected = (unsigned)r->u64();
+        if (const Json *ws = j.find("weights"))
+            for (const Json &x : ws->items)
+                c.weights.push_back(std::bit_cast<double>(x.hex()));
+        if (const Json *cap = j.find("capacity"))
+            c.capacity = cap->hex();
+        if (const Json *cut = j.find("cut")) {
+            for (const Json &x : cut->items)
+                c.cut.push_back(x.hex());
+            for (const Json &x : j["alias"].items)
+                c.alias.push_back(x.hex());
+        }
         // Where the source pins no end: one draw per element, a pair per two Float32 normals.
         const uint64_t p0 = tandem::align_pos(c.start, c.w);
         if (const Json *e = j.find("end"))
@@ -1121,6 +1137,28 @@ static std::vector<NormalKernel> case_paths(sycl::queue &q, const Case &c) {
     return {{Kernel::Chunk, Exchange::Auto, "chunk"}, {Kernel::Tile, Exchange::Auto, "tile"}};
 }
 
+// The alias table of a case's weights, built on the host, with its arrays copied to the device.
+struct DeviceTable {
+    std::vector<uint64_t> cut;
+    std::vector<uint32_t> alias;
+    tandem::ChoiceTable host{}, dev{};
+    bool built;
+    Dev<uint64_t> dcut;
+    Dev<uint32_t> dalias;
+    DeviceTable(sycl::queue &q, const std::vector<double> &weights)
+        : cut(weights.size()), alias(weights.size()),
+          built(tandem::choice_build(host, weights.data(), weights.size(), cut.data(),
+                                     alias.data())),
+          dcut(q, cut.size()), dalias(q, alias.size()) {
+        if (!cut.empty()) {
+            q.memcpy(dcut.p, cut.data(), 8 * cut.size());
+            q.memcpy(dalias.p, alias.data(), 4 * alias.size());
+            q.wait();
+        }
+        dev = tandem::ChoiceTable{host.capacity, dcut.p, dalias.p, host.m};
+    }
+};
+
 // n elements of the case's fill from r on the device by one kernel path, as bit patterns. An
 // empty fill goes through the public API onto a sentinel, which it must leave alone.
 static std::vector<uint64_t> fill_case(sycl::queue &q, const Case &c, Rng &r, uint64_t n,
@@ -1131,9 +1169,15 @@ static std::vector<uint64_t> fill_case(sycl::queue &q, const Case &c, Rng &r, ui
     auto *f32 = reinterpret_cast<float *>(d.p);
     auto *f64 = reinterpret_cast<double *>(d.p);
     const std::string &k = c.kind;
+    const bool choice = k == "fill_choice";
+    std::optional<DeviceTable> table;
+    if (choice)
+        table.emplace(q, c.weights);
     if (n == 0) {
         q.fill(d.p, ~0ull, 1).wait();
-        if (k == "fill_below_u32")
+        if (choice)
+            tandem::fill_choice(q, u32, 0, r, table->dev).wait();
+        else if (k == "fill_below_u32")
             tandem::fill_below(q, u32, 0, r, (uint32_t)c.range).wait();
         else if (k == "fill_below_u64")
             tandem::fill_below(q, d.p, 0, r, c.range).wait();
@@ -1148,7 +1192,11 @@ static std::vector<uint64_t> fill_case(sycl::queue &q, const Case &c, Rng &r, ui
         CHECK(d.host(1)[0] == ~0ull);
         return {};
     }
-    if (k == "fill_below_u32")
+    if (choice)
+        td::fill_kind<td::choice_idx>(q, td::UsmOut<uint32_t>{u32}, n, r, path.kernel, {}, 0,
+                                      table->dev)
+            .wait();
+    else if (k == "fill_below_u32")
         td::fill_kind<td::below32>(q, td::UsmOut<uint32_t>{u32}, n, r, path.kernel, {}, c.range)
             .wait();
     else if (k == "fill_below_u64")
@@ -1163,7 +1211,7 @@ static std::vector<uint64_t> fill_case(sycl::queue &q, const Case &c, Rng &r, ui
         td::fill_kind<td::exp64>(q, td::UsmOut<double>{f64}, n, r, path.kernel, {}).wait();
     else if (k == "fill_exponential_f32")
         td::fill_kind<td::exp32>(q, td::UsmOut<float>{f32}, n, r, path.kernel, {}).wait();
-    if (c.w == 64)
+    if (c.w == 64 && !choice)
         return d.host(n);
     std::vector<uint32_t> h(n);
     q.memcpy(h.data(), u32, 4 * n).wait();
@@ -1208,10 +1256,12 @@ static void check_shift(sycl::queue &q, const std::vector<Case> &cases, const ch
     CHECK(ok);
 }
 
-enum class Scalar { below_u32, below_u64, normal_f64, normal_f32, exp_f64, exp_f32 };
+enum class Scalar { below_u32, below_u64, normal_f64, normal_f32, exp_f64, exp_f32, choice };
 
-static uint64_t scalar_draw(Rng &r, Scalar s, uint64_t range) {
+static uint64_t scalar_draw(Rng &r, Scalar s, uint64_t range, const tandem::ChoiceTable &t) {
     switch (s) {
+    case Scalar::choice:
+        return r.choice(t);
     case Scalar::below_u32:
         return r.urand((uint32_t)range);
     case Scalar::below_u64:
@@ -1232,10 +1282,12 @@ static uint64_t scalar_draw(Rng &r, Scalar s, uint64_t range) {
 static void check_scalars(sycl::queue &q, const Case &c, Scalar s, uint64_t n, uint64_t end) {
     Case head = c;
     head.values.resize(n);
+    const DeviceTable table(q, c.weights);
+    const tandem::ChoiceTable dev_table = table.dev;
     Rng r = Rng::from_key(c.key, c.start, c.K);
     std::vector<uint64_t> host(n);
     for (uint64_t &v : host)
-        v = scalar_draw(r, s, c.range);
+        v = scalar_draw(r, s, c.range, table.host);
     Dev<uint64_t> d(q, n + 1);
     uint64_t *p = d.p;
     const Key key = c.key;
@@ -1244,7 +1296,7 @@ static void check_scalars(sycl::queue &q, const Case &c, Scalar s, uint64_t n, u
     q.single_task([=] {
          Rng g = Rng::from_key(key, start, K);
          for (uint64_t i = 0; i < n; i++)
-             p[i] = scalar_draw(g, s, range);
+             p[i] = scalar_draw(g, s, range, dev_table);
          p[n] = g.position();
      }).wait();
     auto dev = d.host(n + 1);
@@ -1303,6 +1355,71 @@ static void test_cases(sycl::queue &q, const std::string &dir) {
     check_shift(q, normal, "CROSS_NORMAL32[2]", "CROSS_NORMAL32[0]", 2);
     check_shift(q, normal, "CROSS_NORMAL32[1]", "CROSS_NORMALF", 0);
     check_range0(q);
+}
+
+// ---- Weighted choice ------------------------------------------------------------------------
+
+// Both kernels equal the host's choice() calls at random keys, chunk lengths, positions,
+// lengths and output alignments.
+static void check_choice_draws(sycl::queue &q, const DeviceTable &t) {
+    for (const Trial &tr : trials(57, 12)) {
+        Rng r = Rng::from_key(tr.key, tr.pos, tr.K);
+        std::vector<uint32_t> want(tr.n);
+        for (uint32_t &x : want)
+            x = r.choice(t.host);
+        for (Kernel kernel : KERNELS) {
+            Dev<uint32_t> d(q, tr.n + 4);
+            Rng g = Rng::from_key(tr.key, tr.pos, tr.K);
+            tandem::detail::fill_kind<tandem::detail::choice_idx>(
+                q, tandem::detail::UsmOut<uint32_t>{d.p + tr.shift}, tr.n, g, kernel, {}, 0, t.dev)
+                .wait();
+            CHECK(first_diff(want, d.host(tr.n, tr.shift)) == SIZE_MAX &&
+                  g.position() == r.position());
+        }
+    }
+}
+
+// Every case's table, whole where the case pins it, fill, cuts and scalar draws, the shift of a
+// later start, fills at any alignment, buffers, and the weights that build no table.
+static void test_choice(sycl::queue &q, const std::string &dir) {
+    const auto cases = read_cases(dir, "choice.json");
+    size_t tables = 0;
+    for (const Case &c : cases) {
+        const DeviceTable t(q, c.weights);
+        CHECK(t.built && t.host.capacity == c.capacity);
+        if (c.cut.empty())
+            continue;
+        CHECK(t.cut == c.cut &&
+              std::equal(t.alias.begin(), t.alias.end(), c.alias.begin(), c.alias.end()));
+        tables++;
+    }
+    CHECK(tables > 0);
+    check_fill_cases(q, cases);
+    for (const Case &c : cases)
+        if (c.n)
+            check_scalars(q, c, Scalar::choice, c.n, c.end);
+    check_shift(q, cases, "CROSS_CHOICE[1]", "CROSS_CHOICE[0]", 1);
+
+    const DeviceTable t(q, case_named(cases, "choice mixed").weights);
+    check_choice_draws(q, t);
+
+    // A buffer of rank 2 fills in linear order with the values and position of a USM fill.
+    constexpr size_t a = 37, b = 29;
+    Rng u = Rng::from_key(Rng(5).key(), 3, 32), g = u;
+    Dev<uint32_t> d(q, a * b);
+    tandem::fill_choice(q, d.p, a * b, u, t.dev).wait();
+    std::vector<uint32_t> h(a * b);
+    {
+        sycl::buffer<uint32_t, 2> buf(h.data(), sycl::range<2>(a, b));
+        tandem::fill_choice(q, buf, g, t.dev);
+    }
+    CHECK(first_diff(h, d.host(a * b)) == SIZE_MAX && g.position() == u.position());
+
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const std::vector<std::vector<double>> no_table = {{1, -1}, {1, inf}, {nan, 1}, {0, -0.0}, {}};
+    for (const auto &w : no_table)
+        CHECK(!DeviceTable(q, w).built);
 }
 
 // ---- Dumps of hashes.json and position boundaries ------------------------------------------
@@ -1464,6 +1581,7 @@ int main(int argc, char **argv) {
     test_exponential(q);
     test_positions(q);
     test_cases(q, dir);
+    test_choice(q, dir);
     test_dumps(q, hashes);
     check_complex_straddle(q);
     check_random_access(q);
