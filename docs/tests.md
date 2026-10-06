@@ -8,11 +8,12 @@ pixi run -e cuda test-cuda            # AdaptiveCpp 25.10 for CUDA 12.9, Linux w
 
 ## Suite
 
-`tests/test_tandem.cpp` runs every check on the default SYCL device: 3143 checks on the
-AdaptiveCpp CPU device, 3721 on the A100, which also runs the normal fills' shuffle
+`tests/test_tandem.cpp` runs every check on the default SYCL device: 3227 checks on the
+AdaptiveCpp CPU device, 3803 on the A100, which also runs the normal fills' shuffle
 variant. It
-checks every vector of the specification, compares fills with both kernels and in-kernel scalar
-draws against reference stream dumps in `tests/data` (from tandem-cuda), compares fills against
+checks every vector of the specification and every case of its conformance files (see
+below), hashes fills with both kernels and in-kernel scalar draws against the stream SHA-256
+sums of `hashes.json`, compares fills against
 in-kernel draws at random keys, chunk lengths, positions, lengths and output alignments, checks
 fills of every type (bool, 8 to 64-bit, float, double) against the bits of the u32 stream,
 checks that fills split at arbitrary points with host draws between them continue one stream,
@@ -20,29 +21,43 @@ and checks mixed-width draws, random access and derived keys in kernels. In-kern
 draws and double normals equal the host's, in-kernel float normals agree with them to the
 tolerance in [design](design.md). Bounded
 fills are checked against Appendix A written out on host generators, against the sequential
-`urand(range)` calls, and against tandem-cuda's fixtures `tests/cross_fill_below.h` at
-positions 0, 1 and 12345 bits, with rejected draws. A bounded fill cut at an element boundary
-must equal the whole fill at unaligned nonzero starts with ranges that reject a quarter of the
-draws. Double normal fills of both kernels must equal the scalar `normal()` calls bit for bit
+`urand(range)` calls. Double normal fills of both kernels must equal the scalar `normal()` calls bit for bit
 at random keys, chunk lengths, positions, lengths and alignments, with misses and tail values
 among them. A miss list too short for the fill must make the second kernel walk the fill and
 give the same values. Fills from every first draw modulo 16, at K = 1 and 32, on and 8 bytes
 off 16-byte addresses, must equal them too, with each way of passing values between lanes. A
 fill cut at an odd element, at its first miss and just after must equal the
-whole. They must equal tandem-cuda's `tests/cross_fill_normal.h`, and the FNV-1a hash of 10^6
-normals from five starts must equal tandem-c's `a61cfa844c85f7c1`. Float normal
+whole. Float normal
 fills of every kernel variant are checked against the scalar `normalf2()` calls to 16 ulps plus
 1e-6, from random positions and counts and from starts at every word offset within a block and
-several lanes, with K from 1 to 64, and against `tests/cross_fill_normal.h`. Exponential
-fills of both kernels must equal the scalar `exponential()` calls and tandem-cuda's
-`tests/cross_fill_exponential.h` bit for bit, a cut fill must equal the whole, the FNV-1a hash
-of 10^6 double and 10^6 float exponentials from five starts must equal tandem-c's, and 10^7
+several lanes, with K from 1 to 64. Exponential
+fills of both kernels must equal the scalar `exponential()` calls bit for bit, and 10^7
 samples must match the Exp(1) law in their first four moments and a Kolmogorov-Smirnov test.
 In-kernel exponentials equal the host's bit for bit. Signed, Float16, `sycl::half` and complex
 fills, buffers of rank 1 and 2, and the position after empty fills at odd positions are checked
 too.
 
-## Fixtures
+## Conformance files
+
+`tests/conformance/*.json` are byte-identical copies of tandem-spec f420545
+`conformance/*.json`, read by `tests/conformance.hpp`. Each item of the spec's
+`conformance/CHECKLIST.md` has its test:
+
+| checklist section | test |
+|---|---|
+| Fallback by global draw index | `check_fill_cases` on `fill_below.json` and `normal.json`, `check_shift` on the `_AT[4]`, `_AT[6]` and `CROSS_NORMAL[1]` pairs |
+| Width from range | `fill_below` names the width by its element type, checked by the `fill_below.json` cases; `check_range0` |
+| n = 0 | the seven `n = 0` cases through the public fills, onto a sentinel |
+| Odd n | the `CROSS_NORMAL32` cases, values and end |
+| Pair rule for Float32 Box-Muller | `CROSS_NORMALF`, `check_shift` on `CROSS_NORMAL32[1]` and `[2]`, `check_scalars` for `normalf()` |
+| Cut fill | `check_fill_cases` cuts at 1, 7, 20, 21 and n − 1, Float32 normals at the even ones; `check_scalars` |
+| Block and 2^63 position boundaries | `test_streams`, `test_dumps`, `check_complex_straddle`, `check_random_access`, `check_position_bounds` |
+
+The fill cases run on every kernel path: chunk and tile, and for float normals the group
+kernel with local memory and with shuffles. A Float32 normal fill cut at an odd element
+drops that piece's last sin half, so it cuts only between pairs. The Float32 normal dump hash
+holds for C's polynomials, which the host's `normalf2()` takes, so that dump runs on the host.
+`hashes.json` has no fill here for its UInt128 and Char streams.
 
 `tests/vectors.hpp` is generated from the spec repository's `vectors.json` by
 `tools/gen_vectors.py`.
@@ -50,6 +65,7 @@ too.
 ## CI
 
 CI runs the tests on the CPU device with AdaptiveCpp on Linux and macOS and with DPC++ on
-Linux, all with `-Wall -Wextra -Werror`, and fails when the vector header or the data files
-differ from upstream or the submodule pin leaves tandem-cuda's main. The suite also passes on
+Linux, all with `-Wall -Wextra -Werror`, and fails when the vector header differs from
+upstream, a conformance copy differs from tandem-spec f420545, or the submodule pin leaves
+tandem-cuda's main. The suite also passes on
 an NVIDIA A100 with the `cuda` environment.
