@@ -7,7 +7,7 @@ bit, on any SYCL device.
 - [API](api.md): the fills, `tandem::Rng` and its draws.
 - [Design](design.md): the fill kernels, normals and exponentials.
 - [Tests](tests.md): what the suite checks and what CI runs.
-- [Speed](speed.md): A100 figures against tandem-cuda.
+- [Speed](speed.md): A100 figures against tandem-cuda and cuRAND.
 
 ## Install
 

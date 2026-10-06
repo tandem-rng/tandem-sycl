@@ -12,6 +12,9 @@
 #include <vector>
 
 #include <tandem/sycl.hpp>
+#ifdef TANDEM_BENCH_CURAND
+#include "bench_curand.hpp"
+#endif
 
 using clock_type = std::chrono::steady_clock;
 using tandem::detail::Kernel;
@@ -123,5 +126,30 @@ int main(int argc, char **argv) {
         tandem::Rng r = rng;
         tandem::fill_exponential(q, static_cast<double *>(buf), n, r);
     });
+#ifdef TANDEM_BENCH_CURAND
+    /* cuRAND Philox4x32-10 for each output type above. cuRAND has no 8-, 16- or 64-bit integer
+     * output for Philox, so curandGenerate writes the same bytes as 32-bit words. A normal row's
+     * offset is the start draw of the fill_normal row it stands beside. */
+    std::printf("cuRAND %d\n", curand_version());
+    auto curand_row = [&](const char *label, size_t elem_bytes, CurandCall call, size_t num,
+                          size_t den, uint64_t offset) {
+        row(label, elem_bytes, [&](size_t n) { curand_fill(call, buf, n * num / den, offset); });
+    };
+    curand_row("cuRAND curandGenerate uint32_t", 4, CurandCall::Generate, 1, 1, 0);
+    curand_row("cuRAND curandGenerate as uint64_t", 8, CurandCall::Generate, 2, 1, 0);
+    curand_row("cuRAND curandGenerateUniform float", 4, CurandCall::Uniform, 1, 1, 0);
+    curand_row("cuRAND curandGenerateUniformDouble double", 8, CurandCall::UniformDouble, 1, 1, 0);
+    curand_row("cuRAND curandGenerate as uint16_t", 2, CurandCall::Generate, 1, 2, 0);
+    curand_row("cuRAND curandGenerate as uint8_t", 1, CurandCall::Generate, 1, 4, 0);
+    curand_row("cuRAND curandGenerateUniformDouble complex", 16, CurandCall::UniformDouble, 2, 1, 0);
+    curand_row("cuRAND curandGenerateNormal float", 4, CurandCall::Normal, 1, 1, 0);
+    curand_row("cuRAND curandGenerateNormal float, offset 1", 4, CurandCall::Normal, 1, 1, 1);
+    curand_row("cuRAND curandGenerateNormal float, offset 4", 4, CurandCall::Normal, 1, 1, 4);
+    curand_row("cuRAND curandGenerateNormalDouble double", 8, CurandCall::NormalDouble, 1, 1, 0);
+    curand_row("cuRAND curandGenerateNormalDouble double, offset 1", 8, CurandCall::NormalDouble,
+               1, 1, 1);
+    curand_row("cuRAND curandGenerateNormalDouble double, offset 3", 8, CurandCall::NormalDouble,
+               1, 1, 3);
+#endif
     sycl::free(buf, q);
 }

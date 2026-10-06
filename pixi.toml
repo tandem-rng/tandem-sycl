@@ -41,6 +41,10 @@ platforms = ["linux-64"]
 
 [feature.cuda.dependencies]
 adaptivecpp = { version = "25.10.*", build = "cuda129_llvm19*" }
+# cuRAND for the bench's comparison rows.
+cuda-cudart-dev = "*"
+cuda-crt-dev_linux-64 = "*"
+libcurand-dev = "*"
 
 [feature.cuda.activation.env]
 ACPP_CPU_CXX = "$CONDA_PREFIX/bin/clang++"
