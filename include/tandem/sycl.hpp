@@ -657,7 +657,7 @@ inline double normal64_continue(uint64_t r, const Key &sub, uint32_t K, uint64_t
             return (r >> 10) & 1u ? -t : t;
         }
         double y = add_rn(zig_y(i), fmad(fb.drand(), zig_y(i + 1) - zig_y(i), 0.0));
-        if (-0.5 * neg2_log_f64(y) < -0.5 * (x * x))
+        if (-neg_log_f64(y) < -0.5 * (x * x))
             return x;
         r = fb.urand64();
         x = normal64_fast(wk, r, hit);
