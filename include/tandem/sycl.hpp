@@ -842,7 +842,7 @@ inline bool plan_span(Rng &rng, uint64_t n, unsigned align, unsigned bits, Span 
     s.range = s.thresh = 0;
     s.wk = nullptr; /* set by with_layers inside the kernel */
     s.table = ChoiceTable{};
-    rng.set_position(s.p1);
+    rng.advance_to(s.p1);
     return n != 0;
 }
 

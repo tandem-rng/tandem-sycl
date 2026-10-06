@@ -1517,21 +1517,27 @@ static void check_random_access(sycl::queue &q) {
     }
 }
 
-// A UInt64 draw at 2^63 - 1 aligns to 2^63, on the host and in a fill. A fill whose end reaches
-// 2^64 throws before it writes or moves the position, and one that ends just below runs.
+// A generator accepts start 2^63 - 1 and rejects starts 2^63 and 2^64 - 1 without changing
+// state. A UInt64 draw at 2^63 - 1 aligns to 2^63, on the host and in a fill. A fill whose end
+// reaches 2^64 throws before it writes or moves the position, and one that ends just below runs.
 static void check_position_bounds(sycl::queue &q) {
     const Key key = Rng(42).key();
     const uint64_t top = 1ull << 63;
     Rng r = Rng::from_key(key, top - 1, 32);
+    const Rng start = r;
+    CHECK(r.position() == top - 1);
+    CHECK(!r.set_position(top) && r == start);
+    CHECK(!r.set_position(~0ull) && r == start);
     const uint64_t x = r.urand64();
-    CHECK(r.position() == top + 64 && x == Rng::from_key(key, top, 32).at_urand64(0));
+    CHECK(r.position() == top + 64 && x == start.at_urand64(0));
     uint64_t end;
     auto v = device_fill<uint64_t>(q, key, top - 1, 32, 1, Kernel::Auto, 0, &end);
     CHECK(v[0] == x && end == top + 64);
 
     Dev<uint64_t> d(q, 4);
     q.fill(d.p, ~0ull, 4).wait();
-    Rng g = Rng::from_key(key, ~0ull - 255, 32);
+    Rng g = Rng::from_key(key, 0, 32);
+    g.advance_to(~0ull - 255);
     bool threw = false;
     try {
         tandem::fill(q, d.p, 4, g);
