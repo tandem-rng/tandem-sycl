@@ -1,7 +1,8 @@
 # Design
 
-Bounded, normal and exponential draws follow Appendix A of the specification, the contract in
-`core.hpp`, and the same fills in tandem-c, tandem-cuda and tandem-kokkos.
+Bounded, normal and exponential draws follow Appendix A of the specification, weighted choice
+Appendix C, the contract in `core.hpp`, and the same fills in tandem-c, tandem-cuda and
+tandem-kokkos.
 
 ## Fills
 
@@ -10,7 +11,9 @@ One work item steps one chunk. On GPUs and other accelerators with `K >= 8` a wo
 contiguous bytes per 32 items. On CPU devices, and for smaller `K`, each item stores its blocks
 directly. Both store whole 16-byte blocks when the output's blocks are 16-byte aligned, which a
 kernel checks on the device, so USM and buffer outputs share one path. A bool block is 128
-bytes and leaves as eight 16-byte stores. The exponential fills take the same kernels.
+bytes and leaves as eight 16-byte stores. The exponential fills take the same kernels. So
+does the choice fill, which maps each UInt64 draw through the alias table of `core.hpp`'s
+`choice_of` and stores the two `uint32_t` indices of a block as one 8-byte store.
 
 ## Normals
 

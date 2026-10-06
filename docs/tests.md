@@ -8,8 +8,8 @@ pixi run -e cuda test-cuda            # AdaptiveCpp 25.10 for CUDA 12.9, Linux w
 
 ## Suite
 
-`tests/test_tandem.cpp` runs every check on the default SYCL device: 3227 checks on the
-AdaptiveCpp CPU device, 3803 on the A100, which also runs the normal fills' shuffle
+`tests/test_tandem.cpp` runs every check on the default SYCL device: 3363 checks on the
+AdaptiveCpp CPU device, 3939 on the A100, which also runs the normal fills' shuffle
 variant. It
 checks every vector of the specification and every case of its conformance files (see
 below), hashes fills with both kernels and in-kernel scalar draws against the stream SHA-256
@@ -50,14 +50,17 @@ too.
 | n = 0 | the seven `n = 0` cases through the public fills, onto a sentinel |
 | Odd n | the `CROSS_NORMAL32` cases, values and end |
 | Pair rule for Float32 Box-Muller | `CROSS_NORMALF`, `check_shift` on `CROSS_NORMAL32[1]` and `[2]`, `check_scalars` for `normalf()` |
-| Cut fill | `check_fill_cases` cuts at 1, 7, 20, 21 and n − 1, Float32 normals at the even ones; `check_scalars` |
+| Weighted choice | `test_choice`: every table of `choice.json` (whole where pinned, else `capacity`), every case, `check_shift` on `CROSS_CHOICE[1]`, `check_scalars` for `choice()`, the `n = 0` case, rejected weights; `m = 1` is the `choice single` case |
+| Cut fill | `check_fill_cases` cuts every case of the four fill files at 1, 7, 20, 21 and n − 1, Float32 normals at the even ones; `check_scalars` |
 | Block and 2^63 position boundaries | `test_streams`, `test_dumps`, `check_complex_straddle`, `check_random_access`, `check_position_bounds` |
 
 The fill cases run on every kernel path: chunk and tile, and for float normals the group
 kernel with local memory and with shuffles. A Float32 normal fill cut at an odd element
 drops that piece's last sin half, so it cuts only between pairs. The Float32 normal dump hash
 holds for C's polynomials, which the host's `normalf2()` takes, so that dump runs on the host.
-`hashes.json` has no fill here for its UInt128 and Char streams.
+`hashes.json` has no fill here for its UInt128 and Char streams. Choice fills of both kernels
+also equal the `choice()` calls at random keys, chunk lengths, positions, lengths and output
+alignments, and a rank 2 buffer equals the USM fill.
 
 `tests/vectors.hpp` is generated from the spec repository's `vectors.json` by
 `tools/gen_vectors.py`.

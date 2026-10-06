@@ -12,7 +12,7 @@ generator. It produces the stream the specification defines, bit for bit, on any
 On the A100 its normal fills write 1160 GiB/s (f32) and 1066 GiB/s (f64 ziggurat) at the card's power cap.
 
 It needs C++20 and AdaptiveCpp 25.10 or DPC++ 2026.1. The core comes from tandem-cuda
-`0ff5f18`, a submodule in `external/tandem-cuda`.
+`7e37637`, a submodule in `external/tandem-cuda`.
 
 ```sh
 git clone --recurse-submodules https://github.com/tandem-rng/tandem-sycl

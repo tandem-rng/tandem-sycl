@@ -21,6 +21,18 @@ auto e2 = tandem::fill_normal(q, g, n, rng);        // standard normals
 double *t = sycl::malloc_device<double>(n, q);
 auto e3 = tandem::fill_exponential(q, t, n, rng);   // standard exponentials
 
+const double w[] = {1, 2, 3, 4};
+std::vector<uint64_t> cut(4);
+std::vector<uint32_t> alias(4);
+tandem::ChoiceTable table;
+tandem::choice_build(table, w, 4, cut.data(), alias.data());   // on the host, no draws
+uint64_t *dcut = sycl::malloc_device<uint64_t>(4, q);
+uint32_t *dalias = sycl::malloc_device<uint32_t>(4, q);
+q.copy(cut.data(), dcut, 4);
+q.copy(alias.data(), dalias, 4).wait();
+uint32_t *k = sycl::malloc_device<uint32_t>(n, q);
+tandem::fill_choice(q, k, n, rng, {table.capacity, dcut, dalias, table.m});  // i with prob. w[i] / 10
+
 float *y = sycl::malloc_device<float>(m, q);
 q.parallel_for(sycl::range<1>(m), {e1, e2, e3}, [=](sycl::id<1> i) {
     tandem::Rng r = rng.split(i);           // one generator per work item, from the key alone
@@ -55,6 +67,14 @@ q.parallel_for(sycl::range<1>(m), {e1, e2, e3}, [=](sycl::id<1> i) {
 - `tandem::fill_exponential(queue, ptr, n, rng)`: standard exponentials `-log(1 - u)` in
   `float` or `double`, the sequence of `Rng::exponentialf` or `Rng::exponential` calls. Element
   `i` comes from draw `i` of the Float32 (Float64) fill.
+- `tandem::fill_choice(queue, ptr, n, rng, table)` and `tandem::fill_choice(queue, buffer, rng,
+  table)`: weighted choice indices in `uint32_t`, Appendix C of the specification. Element `i`
+  maps UInt64 draw `i` through the alias table, so the fill consumes 64 bits per element,
+  never retries, and equals the `Rng::choice` calls and tandem-c bit for bit. An empty fill
+  aligns the position to 64 bits. `tandem::choice_build(table, weights, m, cut, alias)` from
+  `core.hpp` builds the table on the host from `m` Float64 weights in exact integers. It
+  returns false for no weights, a negative, infinite or NaN weight, or all zeros. The table
+  views the `cut` and `alias` arrays: the fill needs device copies, host draws the host ones.
 - `tandem::Rng`: a value type for draws inside kernels. It holds the transport form (128-bit
   key, 64-bit bit position, chunk length `K`) and one cached chunk state, 80 bytes, and a kernel
   captures it by value. Each work item takes its own generator with `rng.split(i)` or by
@@ -68,7 +88,7 @@ Every fill returns a `sycl::event` and does not wait. The USM forms take an opti
 buffer's dependencies from the SYCL runtime. Positions move as in tandem-cuda: an empty
 `fill` or double `fill_normal` aligns the position to the type's width, and an empty
 `fill_below`, float `fill_normal` or `fill_exponential` consumes no draws and leaves the
-position alone. A fill that would run past
+position alone, and an empty `fill_choice` aligns it to 64 bits. A fill that would run past
 stream position 2^64 throws `std::overflow_error` before it moves the position.
 
 ## Rng draws
@@ -82,6 +102,7 @@ stream position 2^64 throws `std::overflow_error` before it moves the position.
 | `normalf()` | the cos half of a Box-Muller step from two Float32 draws |
 | `normal2()`, `normalf2()` | two ziggurat draws, or both halves of the float step, as a pair `z0`, `z1` |
 | `exponential()`, `exponentialf()` | `-log(1 - u)` of one Float64 or Float32 draw |
+| `choice(table)` | the weighted choice of one UInt64 draw, element 0 of a choice fill |
 | `split(i)`, `sub(purpose)`, `fork(children, n)` | child generators as the specification defines them |
 | `key()`, `position()`, `set_position(p)`, `chunk_length()` | transport form |
 
