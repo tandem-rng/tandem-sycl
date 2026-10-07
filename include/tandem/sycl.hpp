@@ -306,6 +306,32 @@ inline void store_block(typename elem<Kind>::out_t *out, const Span &s, uint64_t
     }
 }
 
+/* Half `half` of the below32w block at stream bit P: draws 2 half and 2 half + 1 into two
+ * uint64_t, one 16-byte store. The tile hands consecutive halves to consecutive work items, as
+ * tandem-cuda's store_tile_widened does. A whole block per work item, two 16-byte stores 32
+ * bytes apart across work items, ran the fill at 40 % of the plain uint64_t fill's rate. */
+template <bool ALIGNED>
+inline void store_widened_half(uint64_t *out, const Span &s, uint64_t P, const uint32_t w[4],
+                               unsigned half) {
+    uint64_t Q = P + half * 64u;
+    /* block_values on the two draws twice over: its out-of-line retries keep the fill at the
+     * plain fill's rate, where a retry inlined beside the store held it at 1120 GiB/s against
+     * 1381. Elements 2 and 3 repeat 0 and 1 and are not stored, so a rejected draw retries
+     * twice. */
+    const uint32_t w2[4] = {w[2 * half], w[2 * half + 1], w[2 * half], w[2 * half + 1]};
+    uint64_t x[4];
+    block_values<below32w>(w2, Q, s, x);
+    if (ALIGNED && Q >= s.p0 && Q + 64u <= s.p1) {
+        store_wide<16>(out + (Q - s.p0) / 32u, x);
+        return;
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        uint64_t q = Q + i * 32u;
+        if (q >= s.p0 && q < s.p1)
+            out[(q - s.p0) / 32u] = x[i];
+    }
+}
+
 /* Auto is Tile on GPUs and other accelerators, else Chunk. The uniform and bounded fills take
  * Chunk for K < 8, the double normal fills below 2^16 elements. */
 enum class Kernel {
@@ -433,9 +459,10 @@ inline void tile_body(typename elem<Kind>::out_t *out, const Span &s, sycl::nd_i
             }
         }
         sycl::group_barrier(it.get_group());
-        /* A bool block is 128 output bytes, so consecutive work items take its 16-byte parts
-         * to keep the stores contiguous. */
-        constexpr unsigned parts = std::is_same_v<Kind, bool> ? 8 : 1;
+        /* A bool block is 128 output bytes and a below32w block 32, so consecutive work items
+         * take their 16-byte parts to keep the stores contiguous. */
+        constexpr unsigned parts =
+            std::is_same_v<Kind, bool> ? 8 : std::is_same_v<Kind, below32w> ? 2 : 1;
         for (unsigned u = rank; u < TILE_SLOTS * parts; u += TILE_ITEMS) {
             unsigned slot = u / parts;
             unsigned sg = slot / (TILE_STEPS * 8), within = slot % (TILE_STEPS * 8);
@@ -444,6 +471,8 @@ inline void tile_body(typename elem<Kind>::out_t *out, const Span &s, sycl::nd_i
                 continue;
             if constexpr (std::is_same_v<Kind, bool>)
                 store_bool_part<ALIGNED>(out, s, P, tile[slot].w, u % parts);
+            else if constexpr (std::is_same_v<Kind, below32w>)
+                store_widened_half<ALIGNED>(out, s, P, tile[slot].w, u % parts);
             else
                 store_block<Kind, ALIGNED>(out, s, P, tile[slot].w);
         }
