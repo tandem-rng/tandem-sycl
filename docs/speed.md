@@ -57,8 +57,10 @@ earlier method.
 
 The normal and exponential fills run below the uniforms because the card holds 250 W: their
 arithmetic lowers its clock until it bounds them, see tandem-cuda's
-[design](https://github.com/tandem-rng/tandem-cuda/blob/main/docs/design.md). The exponentials
-take tandem-cuda's folded logarithm, the same bits with two products fewer. tandem-cuda's device
+[design](https://github.com/tandem-rng/tandem-cuda/blob/main/docs/design.md). The f64
+exponential takes tandem-cuda's folded logarithm, the same bits with two products fewer. The f32
+exponential rows predate tandem-cuda e98daee, whose two-float logarithm adds 10 f32 operations
+per draw, and have not been measured since. tandem-cuda's device
 f32 division and its f32 normal's square root are PTX, which AdaptiveCpp's generic target does
 not compile, so the f32 exponential keeps the IEEE division and runs at 964 GiB/s against
 tandem-cuda's 1149. A build for the `cuda:sm_80` target takes the PTX division but runs the f32

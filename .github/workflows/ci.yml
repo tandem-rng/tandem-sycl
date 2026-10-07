@@ -57,7 +57,7 @@ jobs:
           git diff --exit-code tests/vectors.hpp
       # The copies of the conformance files equal the spec's at the pinned commit, file for file.
       - run: |
-          pin=f4205457e1e2ed19e655e36820015d7bdcf037dd
+          pin=2a4bd08205596bc12bb7ae102862c97a0477dc2e
           diff <(git -C ../tandem-spec ls-tree --name-only $pin conformance/ | grep '\.json$') \
                <(ls tests/conformance/*.json | sed 's|^tests/||')
           for f in tests/conformance/*.json; do

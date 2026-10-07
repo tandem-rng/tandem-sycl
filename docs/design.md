@@ -71,6 +71,8 @@ previous chunk as well at such starts.
 
 ## Exponentials
 
-The exponentials take the same polynomial logarithm in both precisions and equal tandem-c's bit
-for bit on every tested device. Double fills, `Rng::normal` and `Rng::exponential` need a
-device with `aspect::fp64`, `Rng::normalf` and `Rng::exponentialf` do not.
+The exponentials take tandem-cuda's `exponential_f64` and `exponential_f32`: the reference
+polynomial logarithm in f64, and tandem-c's two-float `neg_log_f32` in f32, within 0.571 ulp. Both
+equal tandem-c's bit for bit on every tested device. Double fills, `Rng::normal` and
+`Rng::exponential` need a device with `aspect::fp64`, `Rng::normalf` and `Rng::exponentialf` do
+not.
