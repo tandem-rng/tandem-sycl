@@ -39,9 +39,9 @@ too.
 
 ## Conformance files
 
-`tests/conformance/*.json` are byte-identical copies of tandem-spec f420545
+`tests/conformance/*.json` are byte-identical copies of tandem-spec 2a4bd08
 `conformance/*.json`, read by `tests/conformance.hpp`. Each item of the spec's
-`conformance/CHECKLIST.md` at b31af72, whose JSON files equal f420545's, has its test:
+`conformance/CHECKLIST.md` at the same commit has its test:
 
 | checklist section | test |
 |---|---|
@@ -68,6 +68,6 @@ alignments, and a rank 2 buffer equals the USM fill.
 
 CI runs the tests on the CPU device with AdaptiveCpp on Linux and macOS and with DPC++ on
 Linux, all with `-Wall -Wextra -Werror`, and fails when the vector header differs from
-upstream, a conformance copy differs from tandem-spec f420545, or the submodule pin leaves
+upstream, a conformance copy differs from tandem-spec 2a4bd08, or the submodule pin leaves
 tandem-cuda's main. The suite also passes on
 an NVIDIA A100 with the `cuda` environment.

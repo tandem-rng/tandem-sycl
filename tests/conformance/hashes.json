@@ -1,5 +1,5 @@
 {
-  "source": ["tandem-c 1adf2aca3926c96c3f22ea03c4a5cf2bdbb65acc tests/data, tools/dump_*.c, tests/test_*_bits.c"],
+  "source": ["tandem-c 1c75956c39581836c1f6e190d1072c9a43be6b0d tests/data, tools/dump_*.c, tests/test_*_bits.c"],
   "streams": [
     {"file": "tests/data/k1234_K32_u32.bin", "key": ["00000001", "00000002", "00000003", "00000004"], "K": 32, "start": 0, "type": "UInt32", "n": 65536, "bytes": 262144, "sha256": "7151604c41d53021ba562d55dfaf9433ee8453bb66dc4f23f7e1c249a007d37e"},
     {"file": "tests/data/k1234_K32_u64.bin", "key": ["00000001", "00000002", "00000003", "00000004"], "K": 32, "start": 0, "type": "UInt64", "n": 2048, "bytes": 16384, "sha256": "c54744f6bda13e1bbe66e2fe61a15b1c514c402435df8b9ceee6e31d45e0766f"},
@@ -16,7 +16,7 @@
   ],
   "dumps": [
     {"id": "tools/dump_normals.c", "seed": "000000000000000700000000000007ea", "key": ["2e25d570", "16aed62b", "3ecbb2c7", "0c03725c"], "K": 32, "starts": [0, 1, 77, 12345, 1073741824], "draws": [{"kind": "fill_normal_f64", "n": 1000000}], "bytes": 40000000, "sha256": "700ec4d2f4d6b82aaa56c6eff18a4e5919585fdbd093988773383d580ea610d1", "fnv1a": "a61cfa844c85f7c1"},
-    {"id": "tools/dump_exponentials.c", "seed": "000000000000000700000000000007ea", "key": ["2e25d570", "16aed62b", "3ecbb2c7", "0c03725c"], "K": 32, "starts": [0, 1, 77, 12345, 1073741824], "draws": [{"kind": "fill_exponential_f64", "n": 1000000}, {"kind": "fill_exponential_f32", "n": 1000000}], "bytes": 60000000, "sha256": "5c035a4ef1368231d25a9c2f9201be2df3224e28a14549a50625d0db3770ef4e", "fnv1a": "47f8f98297d94ee2"},
+    {"id": "tools/dump_exponentials.c", "seed": "000000000000000700000000000007ea", "key": ["2e25d570", "16aed62b", "3ecbb2c7", "0c03725c"], "K": 32, "starts": [0, 1, 77, 12345, 1073741824], "draws": [{"kind": "fill_exponential_f64", "n": 1000000}, {"kind": "fill_exponential_f32", "n": 1000000}], "bytes": 60000000, "sha256": "7b12b7c36baf14ab42f7736a5a67925c3c7b1bfafc8d50f078ba1af927044dd5", "fnv1a": "1c761a2d471073c2"},
     {"id": "tests/test_normal_bits.c normal f32", "seed": "000000000000000700000000000007ea", "key": ["2e25d570", "16aed62b", "3ecbb2c7", "0c03725c"], "K": 32, "starts": [0, 1, 77, 12345, 1073741824], "draws": [{"kind": "fill_normal_f32", "n": 1999999}], "bytes": 39999980, "fnv1a": "aa1ea656ce73a4fb"},
     {"id": "tests/test_normal_bits.c Python reference", "key": ["00000001", "00000002", "00000003", "00000004"], "K": 32, "starts": [0], "draws": [{"kind": "fill_normal_f64", "n": 200000}], "bytes": 1600000, "fnv1a": "0c4059ed409d578d", "end": 12800000},
     {"id": "tests/test_normal_bits.c Python reference", "key": ["00000001", "00000002", "00000003", "00000004"], "K": 32, "starts": [2373], "draws": [{"kind": "fill_normal_f64", "n": 200000}], "bytes": 1600000, "fnv1a": "30ce40c86b295193", "end": 12802432}
