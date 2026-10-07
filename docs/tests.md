@@ -46,13 +46,13 @@ too.
 | checklist section | test |
 |---|---|
 | Fallback by global draw index | `check_fill_cases` on `fill_below.json` and `normal.json`, `check_shift` on the `_AT[4]`, `_AT[6]` and `CROSS_NORMAL[1]` pairs |
-| Width from range | `fill_below` names the width by its element type, checked by the `fill_below.json` cases; `check_range0` |
+| Width from range | `check_width_from_range`: every u32 case of `fill_below.json` through `fill_below` into `uint64_t`, by USM and a buffer, `Rng::below` on `CROSS_BELOW32[3]` on the host and in a kernel, ranges 2^32 and 2^32 + 1; the u64 cases through their width-naming kind; `check_range0` |
 | n = 0 | the seven `n = 0` cases through the public fills, onto a sentinel |
 | Odd n | the `CROSS_NORMAL32` cases, values and end |
 | Pair rule for Float32 Box-Muller | `CROSS_NORMALF`, `check_shift` on `CROSS_NORMAL32[1]` and `[2]`, `check_scalars` for `normalf()` |
 | Weighted choice | `test_choice`: every table of `choice.json` (whole where pinned, else `capacity`), every case, `check_shift` on `CROSS_CHOICE[1]`, `check_scalars` for `choice()`, the `n = 0` case, rejected weights; `m = 1` is the `choice single` case |
 | Cut fill | `check_fill_cases` cuts every case of the four fill files at 1, 7, 20, 21 and n − 1, Float32 normals at 2, 8, 20 and the largest even element below n; `check_scalars` |
-| Block and 2^63 position boundaries | `test_streams`, `test_dumps`, `check_complex_straddle`, `check_random_access`, `check_position_bounds`, which runs every item: `Rng` holds any 64-bit position and a fill takes any 64-bit length |
+| Block and 2^63 position boundaries | `test_streams`, `test_dumps`, `check_complex_straddle`, `check_random_access`, `check_position_bounds`, which runs every item: `Rng` holds any 64-bit position and a fill takes any 64-bit length. Uniform, bool, bounded, normal, exponential and choice fills that end exactly at 2^64 throw `std::length_error` and leave the memory and the position unchanged |
 
 The fill cases run on every kernel path: chunk and tile, and for float normals the group
 kernel with local memory and with shuffles. The Float32 normal dump hash

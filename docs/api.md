@@ -51,9 +51,11 @@ q.parallel_for(sycl::range<1>(m), {e1, e2, e3}, [=](sycl::id<1> i) {
 - `tandem::fill_f16_bits(queue, ptr, n, rng)`: the binary16 bit patterns of the Float16 draws
   in `uint16_t`. A `uint16_t` output in `fill` gets raw 16-bit draws.
 - `tandem::fill_below(queue, ptr, n, rng, range)`: uniform integers on `[0, range)` in an
-  unsigned 32- or 64-bit integer type, by Lemire's method as `Rng::urand(range)`. Element `i`
-  takes draw `i` of the u32 (u64) fill and consumes exactly that draw, so the fill advances the
-  position by 32 n (64 n) bits whatever the draws are. A rejected draw retries on a fallback
+  unsigned 32- or 64-bit integer type, by Lemire's method. The call names only the result
+  type, so the draw width comes from the range, as Appendix A requires: element `i` takes draw
+  `i` of the u32 fill for `range <= 2^32`, as `Rng::urand(range)`, else of the u64 fill, as
+  `Rng::urand64(range)`, and consumes exactly that draw, so the fill advances the position by
+  32 n or 64 n bits whatever the draws are. A rejected draw retries on a fallback
   stream, `split(g)` of `sub(PURPOSE_BELOW32)` (or `64`) of the key at position 0, where `g`
   is the draw's global index, the aligned start over 32 (64) plus `i`. A fill without
   rejections equals the sequential `urand(range)` calls, the rare rejection costs no
@@ -88,8 +90,9 @@ Every fill returns a `sycl::event` and does not wait. The USM forms take an opti
 buffer's dependencies from the SYCL runtime. Positions move as in tandem-cuda: an empty
 `fill` or double `fill_normal` aligns the position to the type's width, and an empty
 `fill_below`, float `fill_normal` or `fill_exponential` consumes no draws and leaves the
-position alone, and an empty `fill_choice` aligns it to 64 bits. A fill that would run past
-stream position 2^64 throws `std::overflow_error` before it moves the position.
+position alone, and an empty `fill_choice` aligns it to 64 bits. A fill whose end
+`align(p, w) + w n` reaches 2^64 throws `std::length_error` before it launches, writes or moves
+the position.
 
 ## Rng draws
 
@@ -98,6 +101,7 @@ stream position 2^64 throws `std::overflow_error` before it moves the position.
 | `bit()`, `urand()`, `urand64()`, `frand()`, `drand()` | the specification's Bool, UInt32, UInt64, Float32 and Float64 draws |
 | `at_urand(i)`, `at_urand64(i)`, `at_frand(i)`, `at_drand(i)` | element `i` of the fill that would start here, without advancing |
 | `urand(range)`, `urand64(range)`, `rand(start, end)`, `rand64(start, end)`, `frand(range)`, `drand(start, end)`, ... | bounded draws, uniform by Lemire's multiply and reject |
+| `below(range)` | a bounded draw whose width comes from the range: 32 bits for `range <= 2^32`, else 64 |
 | `normal()`, `normal(mean, sd)` | the ziggurat of one UInt64 draw |
 | `normalf()` | the cos half of a Box-Muller step from two Float32 draws |
 | `normal2()`, `normalf2()` | two ziggurat draws, or both halves of the float step, as a pair `z0`, `z1` |
