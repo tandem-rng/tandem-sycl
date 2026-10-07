@@ -32,6 +32,7 @@ namespace detail {
 
 struct f16_bits {}; /* binary16 bit patterns of the Float16 draws, stored as uint16_t */
 struct below32 {};  /* Lemire bounded draws over the u32 fill, see PURPOSE_BELOW32 */
+struct below32w {}; /* the same into uint64_t, for ranges up to 2^32 */
 struct below64 {};
 struct exp32 {}; /* -log(1 - u) of the f32 draws, spec Appendix A */
 struct exp64 {};
@@ -138,6 +139,11 @@ template <> struct elem<below32> {
     static constexpr unsigned bits = 32;
     static uint32_t draw(const uint32_t w[4], unsigned k) { return w[k]; }
 };
+template <> struct elem<below32w> {
+    using out_t = uint64_t;
+    static constexpr unsigned bits = 32;
+    static uint32_t draw(const uint32_t w[4], unsigned k) { return w[k]; }
+};
 template <> struct elem<below64> {
     using out_t = uint64_t;
     static constexpr unsigned bits = 64;
@@ -156,11 +162,16 @@ template <class Kind>
 constexpr unsigned block_bytes =
     std::is_same_v<Kind, bool> ? 16 : 128 / elem<Kind>::bits * sizeof(typename elem<Kind>::out_t);
 
-/* Whether every block of the fill lands on an address aligned to its output bytes: the output's
- * first byte and the output offset of the fill's first stream bit agree modulo block_bytes. */
+/* The bytes of one wide store: a block's output, or 16-byte parts of the 32 bytes that 32-bit
+ * bounded draws into uint64_t make. */
+template <class Kind>
+constexpr unsigned store_bytes = block_bytes<Kind> < 16 ? block_bytes<Kind> : 16;
+
+/* Whether every block of the fill lands on an address aligned to its stores: the output's first
+ * byte and the output offset of the fill's first stream bit agree modulo store_bytes. */
 template <class Kind> bool blocks_aligned(const typename elem<Kind>::out_t *out, const Span &s) {
     uint64_t first = s.p0 / elem<Kind>::bits * sizeof(typename elem<Kind>::out_t);
-    return ((reinterpret_cast<uintptr_t>(out) - first) & (block_bytes<Kind> - 1u)) == 0;
+    return ((reinterpret_cast<uintptr_t>(out) - first) & (store_bytes<Kind> - 1u)) == 0;
 }
 
 /* An N-byte store, N = 8 or 16, to an N-byte aligned address. NVPTX receives a copy of a
@@ -197,7 +208,8 @@ inline void store_bool_part(bool *out, const Span &s, uint64_t P, const uint32_t
 }
 
 template <class Kind>
-constexpr bool is_below = std::is_same_v<Kind, below32> || std::is_same_v<Kind, below64>;
+constexpr bool is_below = std::is_same_v<Kind, below32> || std::is_same_v<Kind, below32w> ||
+                          std::is_same_v<Kind, below64>;
 
 /* normal_f64_fast of core.hpp on the layers wk. */
 inline double normal64_fast(const zig::Layer *wk, uint64_t r, bool &hit) {
@@ -227,18 +239,16 @@ inline void block_values(const uint32_t w[4], uint64_t P, const Span &s,
                 bool hit;
                 x[k] = normal64_fast(s.wk, elem<Kind>::draw(w, k), hit);
                 rejected |= (unsigned)!hit << k;
+            } else if constexpr (bits == 32) {
+                /* A range up to 2^32 keeps the product below 2^64. */
+                uint64_t m = (uint64_t)elem<Kind>::draw(w, k) * s.range;
+                x[k] = (O)(m >> 32);
+                if ((uint32_t)m < (uint32_t)s.thresh)
+                    rejected |= 1u << k;
             } else {
-                const O range = (O)s.range;
-                O u = elem<Kind>::draw(w, k), lo;
-                if constexpr (sizeof(O) == 4) {
-                    uint64_t m = (uint64_t)u * range;
-                    x[k] = (O)(m >> 32);
-                    lo = (O)m;
-                } else {
-                    x[k] = mulhi64(u, range);
-                    lo = u * range;
-                }
-                if (lo < (O)s.thresh)
+                uint64_t u = elem<Kind>::draw(w, k);
+                x[k] = mulhi64(u, s.range);
+                if (u * s.range < s.thresh)
                     rejected |= 1u << k;
             }
         }
@@ -249,10 +259,10 @@ inline void block_values(const uint32_t w[4], uint64_t P, const Span &s,
             O v;
             if constexpr (std::is_same_v<Kind, normal64>)
                 v = normal_f64_slow(elem<Kind>::draw(w, k), s.key.w, s.K, g);
-            else if constexpr (sizeof(O) == 4)
-                v = below_retry_u32((O)s.range, (O)s.thresh, s.key.w, s.K, g);
+            else if constexpr (bits == 32)
+                v = below_retry_u32((uint32_t)s.range, (uint32_t)s.thresh, s.key.w, s.K, g);
             else
-                v = below_retry_u64((O)s.range, (O)s.thresh, s.key.w, s.K, g);
+                v = below_retry_u64(s.range, s.thresh, s.key.w, s.K, g);
             /* A select per element, since a variable index would put x in local memory. */
             for (unsigned j = 0; j < per_block; j++)
                 if (j == k)
@@ -282,7 +292,10 @@ inline void store_block(typename elem<Kind>::out_t *out, const Span &s, uint64_t
         O x[per_block];
         block_values<Kind>(w, P, s, x);
         if (ALIGNED && P >= s.p0 && P + 128u <= s.p1) {
-            store_wide<block_bytes<Kind>>(out + (P - s.p0) / bits, x);
+            constexpr unsigned N = store_bytes<Kind>;
+            char *dst = reinterpret_cast<char *>(out + (P - s.p0) / bits);
+            for (unsigned part = 0; part < block_bytes<Kind> / N; part++)
+                store_wide<N>(dst + part * N, reinterpret_cast<const char *>(x) + part * N);
             return;
         }
         for (unsigned k = 0; k < per_block; k++) {
@@ -832,13 +845,10 @@ sycl::event fill_normal64_list(sycl::queue &q, const Span &s, const Out &out,
 /* Set the span of a fill that takes `n` elements of `bits` bits from the generator's position
  * aligned to `align` bits, and move the position past them. Returns false for an empty fill. */
 inline bool plan_span(Rng &rng, uint64_t n, unsigned align, unsigned bits, Span &s) {
-    uint64_t p0 = align_pos(rng.position(), align);
-    if (p0 < rng.position() || n > (~(uint64_t)0 - p0) / bits)
-        throw std::overflow_error("tandem::fill: the fill runs past stream position 2^64");
+    s.p1 = fill_end(rng.position(), align, bits, n); /* throws std::length_error at 2^64 */
+    s.p0 = align_pos(rng.position(), align);
     s.K = rng.chunk_length();
     s.key = rng.key();
-    s.p0 = p0;
-    s.p1 = p0 + n * bits;
     s.range = s.thresh = 0;
     s.wk = nullptr; /* set by with_layers inside the kernel */
     s.table = ChoiceTable{};
@@ -864,7 +874,7 @@ sycl::event fill_kind(sycl::queue &q, const Out &out, uint64_t n, Rng &rng, Kern
         return sycl::event();
     s.range = range;
     s.table = table;
-    if constexpr (std::is_same_v<Kind, below32>)
+    if constexpr (std::is_same_v<Kind, below32> || std::is_same_v<Kind, below32w>)
         s.thresh = below_threshold_u32((uint32_t)range);
     else if constexpr (std::is_same_v<Kind, below64>)
         s.thresh = below_threshold_u64(range);
@@ -1303,35 +1313,53 @@ template <class E> struct below {
     static_assert(std::is_unsigned_v<E> && !std::is_same_v<E, bool> &&
                       (sizeof(E) == 4 || sizeof(E) == 8),
                   "tandem::fill_below: the value type must be an unsigned 32- or 64-bit integer");
-    using kind = std::conditional_t<sizeof(E) == 4, below32, below64>;
-    using out_t = typename elem<kind>::out_t;
+    using kind = std::conditional_t<sizeof(E) == 4, below32, below64>; /* the width of E */
 };
+
+/* Run f with the bounded kind of E and range: below32 for 32-bit E, and for 64-bit E below32w
+ * up to range 2^32, else below64. */
+template <class E, class F> sycl::event with_below_kind(uint64_t range, F &&f) {
+    (void)below<E>{};
+    if constexpr (sizeof(E) == 4)
+        return f(below32{});
+    else if (below_width(range) == 32)
+        return f(below32w{});
+    else
+        return f(below64{});
+}
 } // namespace detail
 
-/* Uniform integers on [0, range) in an unsigned 32- or 64-bit integer type, by Lemire's method
- * as Rng::urand(range). Element i takes draw i of the u32 (u64) fill and consumes exactly that
- * one draw, so the fill advances the position by 32 n (64 n) bits whatever the draws are. A
- * rejected draw retries on the fallback stream split(g) of sub(PURPOSE_BELOW32) (or 64) of the
- * key at position 0, g being the draw's global index, aligned start / 32 (64) + i. An empty fill
- * leaves the position alone. Appendix A of the specification. */
+/* Uniform integers on [0, range) in an unsigned 32- or 64-bit integer type, by Lemire's method.
+ * The interface names only the result type, so the draw width comes from the range (spec
+ * Appendix A): element i takes draw i of the u32 fill for range <= 2^32, as Rng::urand(range),
+ * else of the u64 fill, as Rng::urand64(range), and consumes exactly that one draw, so the fill
+ * advances the position by 32 n or 64 n bits whatever the draws are. A rejected draw retries on
+ * the fallback stream split(g) of sub(PURPOSE_BELOW32) (or 64) of the key at position 0, g being
+ * the draw's global index, aligned start / 32 (64) + i. An empty fill leaves the position alone.
+ * Appendix A of the specification. */
 template <class E>
 sycl::event fill_below(sycl::queue &q, E *out, size_t n, Rng &rng, std::type_identity_t<E> range,
                        const std::vector<sycl::event> &deps = {}) {
-    using B = detail::below<E>;
     if (n == 0) /* no draws, so no alignment either */
         return sycl::event();
-    return detail::fill_kind<typename B::kind>(
-        q, detail::UsmOut<typename B::out_t>{reinterpret_cast<typename B::out_t *>(out)}, n, rng,
-        detail::Kernel::Auto, deps, range);
+    return detail::with_below_kind<E>(range, [&](auto kind) {
+        using Kind = decltype(kind);
+        using O = typename detail::elem<Kind>::out_t;
+        return detail::fill_kind<Kind>(q, detail::UsmOut<O>{reinterpret_cast<O *>(out)}, n, rng,
+                                       detail::Kernel::Auto, deps, range);
+    });
 }
 template <class E, int D>
 sycl::event fill_below(sycl::queue &q, sycl::buffer<E, D> &buf, Rng &rng,
                        std::type_identity_t<E> range) {
-    using B = detail::below<E>;
     if (buf.size() == 0)
         return sycl::event();
-    return detail::fill_kind<typename B::kind>(q, detail::BufOut<typename B::out_t, E, D>{buf},
-                                               buf.size(), rng, detail::Kernel::Auto, {}, range);
+    return detail::with_below_kind<E>(range, [&](auto kind) {
+        using Kind = decltype(kind);
+        using O = typename detail::elem<Kind>::out_t;
+        return detail::fill_kind<Kind>(q, detail::BufOut<O, E, D>{buf}, buf.size(), rng,
+                                       detail::Kernel::Auto, {}, range);
+    });
 }
 
 /* Standard normals in float or double, Appendix A of the specification.

@@ -6,6 +6,7 @@
 #include <complex>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 
 #include <limits>
 #include <optional>
@@ -1036,9 +1037,10 @@ static void test_positions(sycl::queue &q) {
         tandem::fill_below(q, reinterpret_cast<uint32_t *>(d.p), 0, r, 6u).wait();
         tandem::fill_below(q, d.p, 0, r, 6u).wait();
         CHECK(r.position() == pos);
-        // One element moves the position past one aligned draw, or past a pair for normals.
+        // One element moves the position past one aligned draw, or past a pair for normals. A
+        // uint64_t output at range 6 takes a 32-bit draw.
         tandem::fill_below(q, d.p, 1, r, 6u).wait();
-        CHECK(r.position() == tandem::align_pos(pos, 64) + 64);
+        CHECK(r.position() == tandem::align_pos(pos, 32) + 32);
         r.set_position(pos);
         tandem::fill_normal(q, reinterpret_cast<float *>(d.p), 1, r).wait();
         CHECK(r.position() == tandem::align_pos(pos, 32) + 64);
@@ -1260,7 +1262,7 @@ static void check_shift(sycl::queue &q, const std::vector<Case> &cases, const ch
     CHECK(ok);
 }
 
-enum class Scalar { below_u32, below_u64, normal_f64, normal_f32, exp_f64, exp_f32, choice };
+enum class Scalar { below_u32, below_u64, below_any, normal_f64, normal_f32, exp_f64, exp_f32, choice };
 
 static uint64_t scalar_draw(Rng &r, Scalar s, uint64_t range, const tandem::ChoiceTable &t) {
     switch (s) {
@@ -1270,6 +1272,8 @@ static uint64_t scalar_draw(Rng &r, Scalar s, uint64_t range, const tandem::Choi
         return r.urand((uint32_t)range);
     case Scalar::below_u64:
         return r.urand64(range);
+    case Scalar::below_any:
+        return r.below(range);
     case Scalar::normal_f64:
         return sycl::bit_cast<uint64_t>(r.normal());
     case Scalar::normal_f32:
@@ -1319,10 +1323,46 @@ static void check_range0(sycl::queue &q) {
     q.fill(d.p, ~0ull, 1).wait();
     tandem::fill_below(q, reinterpret_cast<uint32_t *>(d.p), 1, r, 0u).wait();
     CHECK((uint32_t)d.host(1)[0] == 0 && r.position() == 96);
-    tandem::fill_below(q, d.p, 1, r, (uint64_t)0).wait();
-    CHECK(d.host(1)[0] == 0 && r.position() == 192);
-    CHECK(r.urand(0u) == 0 && r.position() == 224);
-    CHECK(r.urand64((uint64_t)0) == 0 && r.position() == 320);
+    tandem::fill_below(q, d.p, 1, r, (uint64_t)0).wait(); // range 0 <= 2^32: a 32-bit draw
+    CHECK(d.host(1)[0] == 0 && r.position() == 128);
+    CHECK(r.urand(0u) == 0 && r.position() == 160);
+    CHECK(r.urand64((uint64_t)0) == 0 && r.position() == 256);
+}
+
+// Width from range: fill_below names only the result type, so a uint64_t output draws 32 bits for
+// range <= 2^32. Every u32 case of fill_below.json into uint64_t, through USM and a buffer, gives
+// the case's values and end, so 64 elements at range 1000 from the key of seed 42 at position 0
+// are CROSS_BELOW32[3], not CROSS_BELOW64[3]. Rng::below does the same on the host and in a
+// kernel. Range 2^32 returns the draw, and 2^32 + 1 takes 64-bit draws.
+static void check_width_from_range(sycl::queue &q, const std::vector<Case> &fill_below) {
+    for (const Case &c : fill_below) {
+        if (c.kind != "fill_below_u32" || c.n == 0)
+            continue;
+        Dev<uint64_t> d(q, c.n);
+        Rng r = Rng::from_key(c.key, c.start, c.K), b = r;
+        tandem::fill_below(q, d.p, c.n, r, c.range).wait();
+        std::vector<uint64_t> h(c.n);
+        {
+            sycl::buffer<uint64_t, 1> buf(h.data(), sycl::range<1>(c.n));
+            tandem::fill_below(q, buf, b, c.range);
+        }
+        CHECK(matches(c, d.host(c.n)) && matches(c, h) && r.position() == c.end &&
+              b.position() == c.end);
+    }
+    const Case &b32 = case_named(fill_below, "CROSS_BELOW32[3]");
+    CHECK(b32.range == 1000 && b32.start == 0 &&
+          b32.values != case_named(fill_below, "CROSS_BELOW64[3]").values);
+    check_scalars(q, b32, Scalar::below_any, b32.n, 64 * 32);
+    const uint64_t r32 = 1ull << 32;
+    for (uint64_t range : {r32, r32 + 1}) {
+        Dev<uint64_t> d(q, 64);
+        Rng r = Rng::from_key(b32.key, 0, 32), w = r;
+        tandem::fill_below(q, d.p, 64, r, range).wait();
+        std::vector<uint64_t> want(64);
+        for (uint64_t &v : want)
+            v = range == r32 ? w.urand() : w.urand64(range);
+        CHECK(d.host(64) == want && r.position() == w.position());
+    }
 }
 
 static void test_cases(sycl::queue &q, const std::string &dir) {
@@ -1359,6 +1399,7 @@ static void test_cases(sycl::queue &q, const std::string &dir) {
     check_shift(q, normal, "CROSS_NORMAL32[2]", "CROSS_NORMAL32[0]", 2);
     check_shift(q, normal, "CROSS_NORMAL32[1]", "CROSS_NORMALF", 0);
     check_range0(q);
+    check_width_from_range(q, fill_below);
 }
 
 // ---- Weighted choice ------------------------------------------------------------------------
@@ -1538,21 +1579,43 @@ static void check_position_bounds(sycl::queue &q) {
     auto v = device_fill<uint64_t>(q, key, top - 1, 32, 1, Kernel::Auto, 0, &end);
     CHECK(v[0] == x && end == top + 64);
 
+    // Each fill of four elements whose end is exactly 2^64 throws std::length_error and leaves the
+    // memory and the position alone, and two elements fill. w is the bits per element, a Float32
+    // normal pair taking 64 for two elements.
     Dev<uint64_t> d(q, 4);
-    q.fill(d.p, ~0ull, 4).wait();
-    Rng g = Rng::from_key(key, 0, 32);
-    g.advance_to(~0ull - 255);
-    bool threw = false;
-    try {
-        tandem::fill(q, d.p, 4, g);
-    } catch (const std::overflow_error &) {
-        threw = true;
+    const DeviceTable table(q, {1.0, 2.0});
+    struct Fill {
+        unsigned w;
+        std::function<void(Rng &, size_t)> run;
+    };
+    const Fill fills[] = {
+        {64, [&](Rng &g, size_t n) { tandem::fill(q, d.p, n, g).wait(); }},
+        {32, [&](Rng &g, size_t n) { tandem::fill(q, reinterpret_cast<float *>(d.p), n, g).wait(); }},
+        {1, [&](Rng &g, size_t n) { tandem::fill(q, reinterpret_cast<bool *>(d.p), n, g).wait(); }},
+        {32, [&](Rng &g, size_t n) { tandem::fill_below(q, d.p, n, g, 1000).wait(); }},
+        {64, [&](Rng &g, size_t n) { tandem::fill_below(q, d.p, n, g, (1ull << 32) + 1).wait(); }},
+        {64, [&](Rng &g, size_t n) { tandem::fill_normal(q, reinterpret_cast<double *>(d.p), n, g).wait(); }},
+        {32, [&](Rng &g, size_t n) { tandem::fill_normal(q, reinterpret_cast<float *>(d.p), n, g).wait(); }},
+        {32, [&](Rng &g, size_t n) { tandem::fill_exponential(q, reinterpret_cast<float *>(d.p), n, g).wait(); }},
+        {64, [&](Rng &g, size_t n) { tandem::fill_choice(q, reinterpret_cast<uint32_t *>(d.p), n, g, table.dev).wait(); }},
+    };
+    for (const Fill &f : fills) {
+        const uint64_t at = 0ull - 4 * (uint64_t)f.w;
+        q.fill(d.p, ~0ull, 4).wait();
+        Rng g = Rng::from_key(key, 0, 32);
+        g.advance_to(at);
+        bool threw = false;
+        try {
+            f.run(g, 4);
+        } catch (const std::length_error &) {
+            threw = true;
+        }
+        auto h = d.host(4);
+        CHECK(threw && g.position() == at &&
+              std::all_of(h.begin(), h.end(), [](uint64_t y) { return y == ~0ull; }));
+        f.run(g, 2);
+        CHECK(g.position() == at + 2 * (uint64_t)f.w);
     }
-    auto h = d.host(4);
-    CHECK(threw && g.position() == ~0ull - 255 &&
-          std::all_of(h.begin(), h.end(), [](uint64_t y) { return y == ~0ull; }));
-    tandem::fill(q, d.p, 3, g).wait();
-    CHECK(g.position() == ~0ull - 63);
 }
 
 int main(int argc, char **argv) {
