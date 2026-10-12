@@ -11,13 +11,14 @@ Header-only [SYCL](https://www.khronos.org/sycl/) implementation of
 generator. It produces the stream the specification defines, bit for bit, on any SYCL device.
 On the A100 its normal fills write 1160 GiB/s (f32) and 1066 GiB/s (f64 ziggurat) at the card's power cap.
 
-It needs C++20 and AdaptiveCpp 25.10 or DPC++ 2026.1. The core comes from tandem-cuda
-`fd8f2ff`, a submodule in `external/tandem-cuda`.
+## Install
 
 ```sh
 git clone --recurse-submodules https://github.com/tandem-rng/tandem-sycl
 pixi run test                         # AdaptiveCpp, OpenMP backend on the host CPU
 ```
+
+## Quick start
 
 ```cpp
 #include <tandem/sycl.hpp>
@@ -30,9 +31,16 @@ tandem::Rng worker = rng.split(7);          // by index, from the key alone
 tandem::fill_exponential(q, x, n, worker).wait();   // -log(1 - u), bit exact with tandem-c
 ```
 
+## Requirements
+
+It needs C++20 and AdaptiveCpp 25.10 or DPC++ 2026.1. The core comes from tandem-cuda
+`fd8f2ff`, a submodule in `external/tandem-cuda`.
+
+## Documentation
+
 See [API](docs/api.md) for every fill and `Rng` draw, and [design](docs/design.md),
 [tests](docs/tests.md) and [speed](docs/speed.md) for the rest.
 
 Portions of the code were generated with the assistance of LLMs.
 
-[Documentation](https://tandem-rng.github.io/tandem-sycl/) · [Apache 2.0 license](LICENSE)
+[Docs](https://tandem-rng.github.io/tandem-sycl/) · [Specification](https://github.com/tandem-rng/spec/blob/main/SPEC.md) · [Website](https://tandem-rng.github.io/) · [Issues](https://github.com/tandem-rng/tandem-sycl/issues) · [License](LICENSE)
