@@ -1,4 +1,4 @@
-# Speed
+# Performance
 
 `pixi run -e cuda bench-cuda` produces the figures.
 
